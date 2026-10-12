@@ -1,0 +1,6 @@
+-std=c11
+-Iinclude
+-Isrc
+-I../include
+-I../src
+-D_POSIX_C_SOURCE=200809L
