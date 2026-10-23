@@ -99,15 +99,33 @@ int seg_rollover(kv_t *db)
 {
     if (db->next_log > SEG_MAX_LOG)
         return KV_ERR_IO;
+    /*
+     * Make the outgoing segment durable before anything is written to the
+     * next one. Otherwise a crash could keep newer records in the next
+     * segment while losing older ones at the end of this one: recovery
+     * would then see a state that never existed instead of a prefix of the
+     * history. Only writers wait for this; `lock` is not held.
+     */
+    if (io_fsync(db->act_fd) != 0) {
+        kv_set_failed(db);
+        return KV_ERR_FAILED;
+    }
+    pthread_mutex_lock(&db->sync_mu);
+    db->nsyncs++;
+    if (db->written_lsn > db->durable_lsn) {
+        db->durable_lsn = db->written_lsn;
+        pthread_cond_broadcast(&db->sync_cv);
+    }
+    pthread_mutex_unlock(&db->sync_mu);
+    db->unsynced = 0;
+
     segment s = {.id = SEG_ID(db->next_log, 0)};
     if (seg_create(db, s.id, &s.fd, 0) != 0)
         return KV_ERR_IO;
     kv_write_lock(db);
     int rc = seg_insert(db, &s) == 0 ? KV_OK : KV_ERR_NOMEM;
     if (rc == KV_OK) {
-        /* seal the old active segment: it may still hold unsynced bytes */
-        db->segs[db->nsegs - 2].end_lsn = db->written_lsn;
-        db->dir_gen++;
+        db->dir_gen++; /* its directory entry is synced by the next commit */
         kv_maybe_kick_compactor(db);
     }
     kv_unlock(db);
@@ -500,49 +518,35 @@ static int needs_sync(kv_t *db)
 }
 
 /*
- * The leader's fsync. Every byte from `from` up to the current log position
- * lives in the active segment or in a segment sealed since then (end_lsn >
- * from), or it was copied into a compaction output, which is fsynced before
- * its input is retired. Sync all of those, plus the directory if new segment
- * files appeared. The fds are dup'ed under the read lock so a concurrent
- * compaction can close the originals without pulling them out from under us.
+ * The leader's fsync. Sealed segments are durable (rollover syncs them), so
+ * every byte up to the current log position is either already durable or in
+ * the active segment: sync that, plus the directory if a new segment file
+ * appeared since the last time. The fds are dup'ed under the read lock so a
+ * concurrent compaction can close the originals without pulling them out
+ * from under us.
  *
  * Returns 1 on success, with the covered log position in *target; 0 if an
- * fsync failed; -1 if we ran out of descriptors or memory (nothing synced).
+ * fsync failed; -1 if we ran out of descriptors (nothing synced).
  */
-static int leader_sync(kv_t *db, uint64_t from, uint64_t synced_dir,
-                       uint64_t *target, uint64_t *dir_gen)
+static int leader_sync(kv_t *db, uint64_t synced_dir, uint64_t *target,
+                       uint64_t *dir_gen)
 {
     kv_read_lock(db);
     *target = db->written_lsn;
     *dir_gen = db->dir_gen;
-    int *fds = malloc((db->nsegs + 1) * sizeof *fds);
-    int nfds = 0, rc = fds ? 1 : -1;
-    for (size_t i = 0; rc == 1 && i < db->nsegs; i++) {
-        const segment *s = &db->segs[i];
-        if (i + 1 == db->nsegs || s->end_lsn > from) {
-            if ((fds[nfds] = dup(s->fd)) < 0)
-                rc = -1;
-            else
-                nfds++;
-        }
-    }
-    int dirfd = -1;
-    if (rc == 1 && *dir_gen != synced_dir && (dirfd = dup(db->dirfd)) < 0)
-        rc = -1;
+    int fd = dup(seg_active(db)->fd);
+    int dirfd = *dir_gen != synced_dir ? dup(db->dirfd) : -1;
+    int rc = fd >= 0 && (*dir_gen == synced_dir || dirfd >= 0) ? 1 : -1;
     kv_unlock(db);
 
-    for (int i = 0; i < nfds; i++) {
-        if (rc == 1 && io_fsync(fds[i]) != 0)
-            rc = 0;
-        close(fds[i]);
-    }
-    if (dirfd >= 0) {
-        if (rc == 1 && io_fsync_dir(dirfd) != 0)
-            rc = 0;
+    if (rc == 1 && io_fsync(fd) != 0)
+        rc = 0;
+    if (rc == 1 && dirfd >= 0 && io_fsync_dir(dirfd) != 0)
+        rc = 0;
+    if (fd >= 0)
+        close(fd);
+    if (dirfd >= 0)
         close(dirfd);
-    }
-    free(fds);
     return rc;
 }
 
@@ -569,11 +573,11 @@ static int wait_durable(kv_t *db, uint64_t lsn)
             continue;
         }
         db->syncing = 1;
-        uint64_t from = db->durable_lsn, synced_dir = db->durable_dir;
+        uint64_t synced_dir = db->durable_dir;
         pthread_mutex_unlock(&db->sync_mu);
 
         uint64_t target, dir_gen;
-        int ok = leader_sync(db, from, synced_dir, &target, &dir_gen);
+        int ok = leader_sync(db, synced_dir, &target, &dir_gen);
 
         pthread_mutex_lock(&db->sync_mu);
         db->syncing = 0;

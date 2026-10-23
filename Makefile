@@ -8,6 +8,7 @@
 #   make test-asan  run the test suite under ASan/UBSan
 #   make test-tsan  run the concurrent tests under ThreadSanitizer
 #   make bench      build and run the benchmarks
+#   make fuzz       build the libFuzzer targets (clang) and run each a while
 #   make clean
 
 CC      ?= cc
@@ -52,7 +53,7 @@ TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
 BENCH   := $(B)/bench
 
-.PHONY: all debug asan tsan test test-asan test-tsan bench bench-quick clean
+.PHONY: all debug asan tsan test test-asan test-tsan bench bench-quick fuzz clean
 
 all: $(LIB) $(SERVER) $(TEST_BIN) $(BENCH)
 
@@ -108,6 +109,28 @@ bench: $(BENCH)
 
 bench-quick: $(BENCH)
 	$(BENCH) --dir $(BENCH_DIR) --quick
+
+# libFuzzer targets (needs clang). make fuzz FUZZ_TIME=<seconds per target>
+FUZZ_CC     ?= clang
+FUZZ_FLAGS  := -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
+               -Iinclude -Isrc -D_POSIX_C_SOURCE=200809L
+FUZZ_TARGETS:= fuzz_protocol fuzz_recovery fuzz_ops
+FUZZ_TIME   ?= 60
+
+build/fuzz/%: fuzz/%.c fuzz/fuzz_util.h $(LIB_SRC) src/server.c $(wildcard src/*.h)
+	@mkdir -p build/fuzz
+	$(FUZZ_CC) $(FUZZ_FLAGS) $< $(LIB_SRC) src/server.c -lpthread -o $@
+
+fuzz: $(FUZZ_TARGETS:%=build/fuzz/%)
+	@set -e; for t in $(FUZZ_TARGETS); do \
+	  mkdir -p build/fuzz/corpus/$$t; \
+	  echo "== $$t ($(FUZZ_TIME)s)"; \
+	  build/fuzz/$$t -max_total_time=$(FUZZ_TIME) -max_len=2048 \
+	    -print_final_stats=1 build/fuzz/corpus/$$t 2>&1 | \
+	    grep -E "^(Done|stat::number_of_executed_units|stat::new_units_added)|ERROR|SUMMARY" || true; \
+	  test -z "$$(ls crash-* leak-* timeout-* 2>/dev/null)" || \
+	    { echo "fuzzer found a failure:"; ls crash-* leak-* timeout-* 2>/dev/null; exit 1; }; \
+	done
 
 clean:
 	rm -rf build

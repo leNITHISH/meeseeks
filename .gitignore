@@ -1,3 +1,7 @@
 build/
 data/
 bench-data/
+crash-*
+leak-*
+timeout-*
+oom-*

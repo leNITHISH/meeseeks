@@ -38,10 +38,6 @@ typedef struct {
     unsigned flags;
     uint64_t size;      /* bytes of valid records */
     uint64_t hint_size; /* size of its .hint file, 0 if none */
-    /* For a log segment sealed during this session: the log position of its
-     * end. If that is past durable_lsn, the segment still needs an fsync.
-     * 0 for segments that were already durable (recovered or compacted). */
-    uint64_t end_lsn;
 } segment;
 
 struct kv {
@@ -151,9 +147,8 @@ int seg_insert(kv_t *db, const segment *s);
 /* Create an empty log segment file. With sync_dir, also make its directory
  * entry durable right away; otherwise the next group commit does. */
 int seg_create(kv_t *db, uint64_t id, int *fd_out, int sync_dir);
-/* Seal the active segment and start log segment next_log. Requires write_mu;
- * takes `lock` briefly. Does no fsync: the sealed segment is synced by the
- * next group commit, so nobody waits behind a flush of a whole segment. */
+/* Seal the active segment (fsync it) and start log segment next_log.
+ * Requires write_mu; takes `lock` only briefly, never across the fsync. */
 int seg_rollover(kv_t *db);
 /* Wait until every byte written so far is durable (group commit). */
 int kv_sync_all(kv_t *db);

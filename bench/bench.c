@@ -641,8 +641,16 @@ static void bench_mixed(void)
     size_t cap = 20000000;
     uint64_t *lat = malloc(cap * sizeof *lat);
     for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
-        kv_t *db = fresh(cases[c].pol, 1);
+        /* preload without fsync, then reopen with the policy under test */
+        kv_t *db = fresh(KV_SYNC_NONE, 1);
         load(db, nkeys, VAL_LEN);
+        kv_close(db);
+        kv_options o;
+        kv_default_options(&o);
+        o.sync_policy = cases[c].pol;
+        int orc = kv_open(g_dir, &o, &db);
+        if (orc != KV_OK)
+            die("open", orc);
         bw_arg w = {db, cases[c].vlen, 0, 0};
         pthread_t th;
         if (cases[c].vlen)
