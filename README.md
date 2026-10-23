@@ -187,7 +187,7 @@ Two problems shaped this design, both found by tests:
 | `test_kill` | 100 SIGKILLs at random moments, including mid-compaction, all on one directory. Every acknowledged put (about 160,000 per run) must survive with its exact value. |
 | `test_faults` | A full disk (via `RLIMIT_FSIZE`) during writes and halfway through a compaction. The torn record must be rolled back, everything acknowledged must stay readable, and a later compaction must succeed. |
 | `test_powerfail` | Power-failure simulation, described below. About 15,600 crash images per run. |
-| `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits |
+| `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause |
 | `test_server` | The protocol, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 8 concurrent clients, shutdown with clients connected |
 
 **Power-failure checker.** A SIGKILL test keeps the page cache, so it cannot tell whether the right fsyncs happen. `tests/pf_shim.c` is loaded with `LD_PRELOAD` and records every create, write, truncate, fsync, rename and unlink the unmodified library makes in the store directory. `test_powerfail` replays that log through a model of a POSIX filesystem and, at every point in it, builds four images of what the disk could hold after a power cut:
