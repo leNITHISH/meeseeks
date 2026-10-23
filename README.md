@@ -10,13 +10,15 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 
 | | |
 |---|---|
-| writes, fsync on every write | 650/s single thread, 2,300/s with 8 threads sharing fsyncs |
-| writes, fsync every 100 | 40,000/s |
-| writes, no fsync | 230,000/s |
-| get latency, 1M keys | 2.1 us p50 from page cache, 157 us p50 from the SSD |
-| startup, 1M keys | 0.32 s from hint files, 1.5 s replaying 1 GB of segments |
-| index memory | 69 bytes per key |
-| worst get latency while a compaction runs | 0.26 ms |
+| writes, fsync on every write | 520/s from one thread, 2,200/s from 8 threads sharing fsyncs |
+| writes, fsync every 100 | 39,000/s |
+| writes, no fsync | 198,000/s |
+| get latency, 1M keys | 1.9 us p50 from the page cache, 122 us p50 from the SSD |
+| reads, 1M keys | 474,000/s from one thread, 1.14M/s from four |
+| startup, 1M keys | 0.31 s from hint files, 1.4 s replaying 1 GB of segments |
+| index memory | 66 bytes per key |
+| gets while a compaction runs | p99.9 of 18.5 us, worst 1.5 ms |
+| TCP server, 8 pipelining clients | 189,000 requests/s at 90% GET |
 
 ## Contents
 
@@ -92,7 +94,7 @@ The log is split into segment files, 64 MiB by default. Writes go to the active 
 
 Files are named `<log>-<sub>.seg`. Normal log segments have sub 0 (`0000000007-000000.seg`). Compacting everything up to log segment 7 produces `0000000007-000001.seg`, `0000000007-000002.seg` and so on, which sort after all of their inputs and before log segment 8. Recovery replays files in name order, and this naming is what lets new writes continue during compaction: they go to segment 8 and later, so they always win over the compacted copies.
 
-A compacted segment has a hint file next to it with one entry per record: key, offset, record size, timestamp and a CRC of the entry, but no value. Startup reads hints instead of segments, which is 4.6 times faster for 1M keys with 1 KB values.
+A compacted segment has a hint file next to it with one entry per record: key, offset, record size, timestamp and a CRC of the entry, but no value. For 1M keys with 1 KB values, startup from hints takes 0.31 s instead of 1.4 s with the page cache warm, and 0.40 s instead of 2.1 s with it cold.
 
 ### Index
 
@@ -114,7 +116,7 @@ Writers are serialized by a mutex and append records with `pwrite`. The store's 
 | `KV_SYNC_EVERY_N` (default, n=100) | written; every nth write waits for an fsync covering all before it | up to n-1 acknowledged writes |
 | `KV_SYNC_NONE` | written to the page cache | whatever the OS had not flushed |
 
-Durability uses group commit. A writer that needs an fsync either becomes the leader and fsyncs the active segment, or waits for the leader already inside fsync and is covered by the next round. With 8 writer threads and `KV_SYNC_ALWAYS`, each fsync covers about 4 writes, and throughput goes from 650 to 2,300 writes per second.
+Durability uses group commit. A writer that needs an fsync either becomes the leader and fsyncs the active segment, or waits for the leader already inside fsync and is covered by the next round. With 8 writer threads and `KV_SYNC_ALWAYS`, each fsync covers about 4 writes, and throughput goes from 570 to 2,230 writes per second.
 
 Whatever the policy, a crash never leaves a state that did not exist. Recovery always produces the result of some prefix of the operations, with nothing missing from the middle. That takes some care:
 
@@ -171,7 +173,7 @@ There are three locks, always taken in the order compaction mutex, writer mutex,
 Two problems shaped this design, both found by tests:
 
 - glibc's `pthread_rwlock_t` prefers readers, so a steady stream of gets starved writers forever: the concurrency test simply hung. A waiting writer now holds a turnstile mutex that readers must pass through. Readers check an atomic counter first and skip the turnstile when no writer is waiting, so the common read path adds only that one load.
-- Originally writers held the store lock across their `pwrite`. On btrfs a `pwrite` blocks for the whole of a concurrent fsync of the same file, and on any Linux filesystem dirty-page throttling can stall it for much longer. Every reader waited too. Next to a writer storing 4 KiB values, the worst get took **1.03 seconds**. With the writer mutex holding the store lock only to publish, it takes 0.3 ms.
+- Originally writers held the store lock across their `pwrite`. On btrfs a `pwrite` can block behind a concurrent fsync of the same file, and on any Linux filesystem dirty-page throttling can stall it for much longer. Every reader waited too. Next to a writer storing 4 KiB values, the worst get took **1.03 seconds** and the p99.9 was 559 us. Now the writer mutex is held across the `pwrite` and the store lock only to publish: in the benchmark below the worst get is 3.6 ms and the p99.9 is 164 us, and the writer itself is twice as fast.
 
 ## Testing
 
@@ -225,9 +227,101 @@ Measured with `make bench` (source in [`bench/bench.c`](bench/bench.c)).
 
 - **Machine:** an Intel Core i3-4005U laptop (2 cores, 4 threads, 1.7 GHz, from 2013) with 8 GB of RAM and a Crucial BX500 240 GB SATA SSD (DRAM-less), btrfs, Linux 7.2.
 - **Setup:** keys are 16 bytes and values 100 bytes unless noted.
-- **Method:** a desktop session with a busy browser was running on the same four hardware threads, so every number is the best of three runs (for the latency sections, the run with the lowest p99.9). Between runs, tails and fsync-bound numbers still move by 20 to 50 percent; medians and throughput without fsync move much less.
+- **Method:** a desktop session with a busy browser shared the four hardware threads. To filter out its interference, the throughput, group-commit, startup and reader-scaling numbers are the best of three runs; the compaction-latency table is the run with the lowest get p99.9; the table of reads next to a busy writer is the run where the writer got the most done. The rest are single runs of many samples. Between runs, tails and fsync-bound numbers still move by 20 to 50 percent; medians and throughput without fsync move much less.
 
-BENCHMARK_RESULTS
+### Index memory (1000k keys of 16 bytes)
+
+The index holds 62.5 MiB: 66 bytes per key. Opening the store grew the resident set by 63.0 MiB.
+
+### Write throughput (1 thread, 16 B keys, 100 B values)
+
+| fsync policy | writes | ops/sec | avg latency |
+|---|---:|---:|---:|
+| every write (`KV_SYNC_ALWAYS`) | 3000 | 523 | 1912.3 us |
+| every 100 writes (`KV_SYNC_EVERY_N`) | 300000 | 39322 | 25.4 us |
+| never (`KV_SYNC_NONE`) | 1000000 | 198289 | 5.0 us |
+
+### Group commit: `KV_SYNC_ALWAYS` with concurrent writers
+
+Every put returns only after its data is fsynced. Writers waiting at the same time share one fsync.
+
+| writer threads | ops/sec | writes per fsync |
+|---:|---:|---:|
+| 1 | 571 | 1.00 |
+| 2 | 654 | 1.24 |
+| 4 | 1117 | 2.08 |
+| 8 | 2233 | 4.05 |
+
+Two writers gain little: on btrfs a write to a file can wait for an fsync of that file in progress, so two writers mostly take turns instead of sharing. More writers queue up behind each fsync and share it.
+
+### Get latency next to a busy writer (100k keys)
+
+One thread does random gets while another writes as fast as it can. Of 3 runs, the one with the most writes is shown, so the read numbers are under the heaviest load seen.
+
+| writer | writes/sec | get p50 | get p99 | get p99.9 | get max |
+|---|---:|---:|---:|---:|---:|
+| none | 0 | 1.8 us | 3.1 us | 10.5 us | 56.5 us |
+| fsync every write, 100 B | 561 | 1.9 us | 4.5 us | 19.8 us | 1435.8 us |
+| no fsync, 4 KiB values | 22687 | 2.7 us | 20.6 us | 164.4 us | 3616.6 us |
+
+### Get latency (random keys, page cache warm)
+
+| keys | p50 | p99 | p99.9 | max |
+|---:|---:|---:|---:|---:|
+| 100k | 1.9 us | 5.5 us | 18.0 us | 288.1 us |
+| 1000k | 1.9 us | 2.8 us | 7.8 us | 34.5 us |
+
+### Get latency, cold (page cache evicted, 1000k keys)
+
+| reads | p50 | p99 | p99.9 | max |
+|---:|---:|---:|---:|---:|
+| 20000 | 122.0 us | 744.2 us | 3603.0 us | 23174.6 us |
+
+Each get is one `pread`, which here has to go to the SSD. The median is that drive's random-read latency; the tail is the drive too.
+
+### Disk usage before and after compaction
+
+100k keys, each overwritten 9 times (100 B values), plus 10% of keys deleted.
+
+| | disk usage | segments | live data |
+|---|---:|---:|---:|
+| before | 130.0 MiB | 3 | 11.7 MiB |
+| after | 15.4 MiB | 2 | 11.7 MiB |
+
+Compaction took 0.81 s (162 MiB/s of input), leaving 11.9% of the original size (the rest is hint files).
+
+### Startup time (rebuilding the index of 1000k keys, 1000 B values)
+
+| index source | page cache | open time |
+|---|---|---:|
+| hint files | cold | 398 ms |
+| full replay of segments | cold | 2074 ms |
+| hint files | warm | 311 ms |
+| full replay of segments | warm | 1414 ms |
+
+Data: 988 MiB of segments; hint files: 42 MiB.
+
+### Read throughput vs reader threads (1000k keys, warm, 4 hardware threads)
+
+| reader threads | gets/sec | speedup |
+|---:|---:|---:|
+| 1 | 474299 | 1.00x |
+| 2 | 868817 | 1.83x |
+| 4 | 1139325 | 2.40x |
+| 8 | 1143863 | 2.41x |
+
+### Latency while compaction runs (200k keys x 5 versions)
+
+Gets and puts issued from one thread while another thread compacts the store, compared with an idle store. Best of 3 runs by get p99.9 during compaction.
+
+| | op | p50 | p99 | p99.9 | max |
+|---|---|---:|---:|---:|---:|
+| idle | get | 2.0 us | 3.3 us | 8.4 us | 34.3 us |
+| idle | put | 3.4 us | 7.9 us | 14.7 us | 208.9 us |
+| during compaction | get | 2.1 us | 5.6 us | 18.5 us | 1461.1 us |
+| during compaction | put | 3.5 us | 114.8 us | 213.6 us | 55112.8 us |
+
+The 55 ms put is the fsync that seals the active segment when compaction starts; only writers wait for it. In the first version, compaction held the store lock from start to finish, so every read and write waited for the whole compaction. The next version still did that fsync under the store lock, and the worst get in this test was 82 ms.
 
 ## TCP server
 
@@ -252,6 +346,18 @@ ERR wrong number of arguments for 'GET'
 ```
 
 The value is everything after the single space that follows the key, so it can contain spaces. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection. Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address. SIGINT or SIGTERM closes the store cleanly.
+
+Throughput, measured with [`bench/loadgen.c`](bench/loadgen.c) on the laptop described under [Benchmarks](#benchmarks). Client and server share its four hardware threads, the store uses the default fsync policy (every 100 writes), values are 100 bytes, and each row is the best of three 4-second runs:
+
+| clients | requests in flight per client | mix | requests/s | round trip p50 |
+|---:|---:|---|---:|---:|
+| 1 | 1 | 90% GET | 28,000 | 29 us |
+| 8 | 1 | 90% GET | 58,300 | 112 us |
+| 8 | 32 | 90% GET | 188,700 | 1.0 ms |
+| 8 | 32 | 50% GET | 83,600 | 2.1 ms |
+| 8 | 32 | all SET | 63,400 | 2.3 ms |
+
+Mixed pipelines sometimes stall for around 100 ms. A write can wait for an fsync of the same file in progress, and this SSD's fsyncs occasionally take that long; every client with a SET in its batch then waits too.
 
 ## kvtool
 
