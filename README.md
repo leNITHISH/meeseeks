@@ -36,6 +36,7 @@ make            # library, server, kvtool, tests, benchmark (build/release)
 make test       # full test suite, about 20 seconds
 make test-asan  # the suite under AddressSanitizer + UBSan
 make test-tsan  # concurrent tests under ThreadSanitizer
+make coverage   # line coverage of src/ by the test suite (gcc + gcov)
 make fuzz       # libFuzzer targets, 60 s each (needs clang)
 make bench BENCH_DIR=/path/on/real/disk
 ```
@@ -124,7 +125,7 @@ Whatever the policy, a crash never leaves a state that did not exist. Recovery a
 - A new segment file's directory entry is fsynced before any record goes into it. POSIX lets unsynced directory changes persist in any combination, so without this, segment N+2 could survive a power cut while N+1 vanished. The power-failure checker found this one.
 - Compaction output is fsynced before it is renamed into place, and the directory is fsynced before the MANIFEST that retires the inputs.
 
-If an fsync fails, the store refuses all further writes (`KV_ERR_FAILED`) until it is reopened. After a failed fsync, Linux may already have dropped the dirty pages it could not write and will not report the error again, so retrying could falsely succeed. This is what PostgreSQL learned in 2018 ("fsyncgate").
+If any fsync fails, of a segment, compaction output or directory, the store refuses all further writes (`KV_ERR_FAILED`) until it is reopened. After a failed fsync, Linux may already have dropped the dirty pages it could not write and will not report the error again, so retrying could falsely succeed. This is what PostgreSQL learned in 2018 ("fsyncgate").
 
 On macOS `fsync` only reaches the drive's cache, so the store uses `fcntl(F_FULLFSYNC)` there.
 
@@ -177,7 +178,7 @@ Two problems shaped this design, both found by tests:
 
 ## Testing
 
-`make test` runs eight suites in about 20 seconds. They are also run under AddressSanitizer + UBSan (`make test-asan`) and ThreadSanitizer (`make test-tsan`).
+`make test` runs nine suites in about 20 seconds. They are also run under AddressSanitizer + UBSan (`make test-asan`) and ThreadSanitizer (`make test-tsan`), and `make coverage` reports how much of `src/` they execute: 92% of `kv.c`, 88% of compaction and recovery, 93% of the index, all of the record format and CRC code. Most of what is left is handling of failed memory allocations.
 
 | suite | what it does |
 |---|---|
@@ -187,6 +188,7 @@ Two problems shaped this design, both found by tests:
 | `test_kill` | 100 SIGKILLs at random moments, including mid-compaction, all on one directory. Every acknowledged put (about 160,000 per run) must survive with its exact value. |
 | `test_faults` | A full disk (via `RLIMIT_FSIZE`) during writes and halfway through a compaction. The torn record must be rolled back, everything acknowledged must stay readable, and a later compaction must succeed. |
 | `test_powerfail` | Power-failure simulation, described below. About 15,600 crash images per run. |
+| `test_fsyncfail` | fsync starts failing with EIO after N calls (an `LD_PRELOAD` shim), for every N from 0 to 80: while opening, on group commits, at segment rollover and inside compaction, with one and four writers. The store must refuse further writes, keep serving reads, release every waiting writer, and lose no acknowledged write once reopened. |
 | `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause |
 | `test_server` | The protocol, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 8 concurrent clients, shutdown with clients connected |
 
@@ -221,6 +223,7 @@ Bugs I wrote and the suite found:
 - **Out-of-order durability across rollover.** While fixing the 82 ms stall I first made the sealing fsync lazy, which let a crash keep newer records while losing older ones. I noticed while designing the power-failure checker, and the checker confirms it: removing that fsync fails the test.
 - **Segment directory entries made durable out of order**, found by the power-failure checker's reorder model, described under [Writes and durability](#writes-and-durability).
 - **A key that could be stored but never read back**, found by `fuzz_protocol` in CI. A key ending in a carriage return was accepted by `SET`, but `GET` puts that carriage return at the end of the line, where it reads as a CRLF line ending, so the lookup used a different key. The protocol now refuses carriage returns in keys and values. The input is kept in `fuzz/regressions/` and replayed on every fuzz run.
+- **fsync failures handled inconsistently**, found by `test_fsyncfail` after coverage showed that path had never run. Only a failed fsync of a segment's data made the store refuse writes; a failed directory fsync at rollover returned an ordinary I/O error and writing went on, and a failed fsync of compaction output, whose records may already be serving reads, only aborted the compaction.
 - **A server that never shut down on macOS**, found by CI. The accept loop was woken by calling `shutdown()` on the listening socket, which works on Linux, but on macOS and the BSDs it fails and `accept()` keeps waiting. The loop now waits in `poll()` on the socket and a self-pipe.
 
 ## Benchmarks
@@ -419,7 +422,7 @@ src/crc32.c         slice-by-8 CRC-32
 src/io.c            pread/pwrite loops, fsync, buffered reader and writer
 src/server.c        TCP server and protocol
 tools/kvtool.c      offline checker and dump
-tests/              the suites above, plus the LD_PRELOAD recorder
+tests/              the suites above, plus the LD_PRELOAD recorder and fault injector
 fuzz/               libFuzzer targets
 bench/bench.c       benchmarks
 bench/loadgen.c     load generator for kvserver
