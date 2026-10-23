@@ -8,6 +8,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,7 +163,10 @@ int server_handle_line(kv_t *db, const char *line, size_t len, sbuf *out)
 
 /* ---------- networking ---------- */
 
-static volatile sig_atomic_t g_stopping;
+/* Set from server_stop(), which may run in a signal handler or another thread.
+ * A lock-free atomic is safe in both places; volatile sig_atomic_t only covers
+ * the signal-handler case and is a data race between threads. */
+static atomic_int g_stopping;
 
 /* Open client sockets, so shutdown can kick blocked readers. */
 static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -300,24 +304,24 @@ int server_listen(const char *host, int port, int *fd_out, int *port_out)
                         ? ntohs(((struct sockaddr_in6 *)&ss)->sin6_port)
                         : ntohs(((struct sockaddr_in *)&ss)->sin_port);
     }
-    g_stopping = 0;
+    atomic_store(&g_stopping, 0);
     *fd_out = fd;
     return 0;
 }
 
 void server_stop(int listen_fd)
 {
-    g_stopping = 1;
+    atomic_store(&g_stopping, 1);
     shutdown(listen_fd, SHUT_RDWR); /* wakes a blocked accept() */
 }
 
 int server_serve(kv_t *db, int listen_fd)
 {
     int rc = 0;
-    while (!g_stopping) {
+    while (!atomic_load(&g_stopping)) {
         int fd = accept(listen_fd, NULL, NULL);
         if (fd < 0) {
-            if (g_stopping)
+            if (atomic_load(&g_stopping))
                 break;
             if (errno == EINTR || errno == ECONNABORTED)
                 continue;
