@@ -24,6 +24,7 @@
 #define SERVER_MAX_LINE (1u << 20)
 #define SERVER_DEFAULT_MAX_CONNS 1024
 #define SERVER_FLUSH_BYTES (1u << 20) /* most reply bytes held per client */
+#define SERVER_DEFAULT_IDLE_MS 300000u
 
 typedef struct {
     char *data;
@@ -39,6 +40,10 @@ int server_handle_line(kv_t *db, const char *line, size_t len, sbuf *out);
 /* Most clients served at once (each gets a thread); further connections
  * are answered "ERR too many connections" and closed. */
 void server_set_max_conns(size_t n);
+
+/* Close a client after it has sent nothing, or not taken its replies, for
+ * this long. 0 disables the timeout. */
+void server_set_idle_timeout(unsigned ms);
 
 /* Bind and listen on host:port (port 0 picks a free port). */
 int server_listen(const char *host, int port, int *fd_out, int *port_out);

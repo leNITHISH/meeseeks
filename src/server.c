@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -201,11 +202,19 @@ static pthread_cond_t g_conn_cv = PTHREAD_COND_INITIALIZER;
 static int *g_conns;
 static size_t g_nconns, g_conns_cap;
 static size_t g_max_conns = SERVER_DEFAULT_MAX_CONNS;
+static unsigned g_idle_ms = SERVER_DEFAULT_IDLE_MS;
 
 void server_set_max_conns(size_t n)
 {
     pthread_mutex_lock(&g_conn_mu);
     g_max_conns = n ? n : 1;
+    pthread_mutex_unlock(&g_conn_mu);
+}
+
+void server_set_idle_timeout(unsigned ms)
+{
+    pthread_mutex_lock(&g_conn_mu);
+    g_idle_ms = ms;
     pthread_mutex_unlock(&g_conn_mu);
 }
 
@@ -414,6 +423,18 @@ int server_serve(kv_t *db, int listen_fd)
         set_flags(fd, 0, O_NONBLOCK);
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        /* A client that sends nothing, or never reads its replies, would
+         * hold its slot and thread forever: time out both directions.
+         * recv/send then fail with EAGAIN and the connection is closed. */
+        pthread_mutex_lock(&g_conn_mu);
+        unsigned idle = g_idle_ms;
+        pthread_mutex_unlock(&g_conn_mu);
+        if (idle) {
+            struct timeval tv = {(time_t)(idle / 1000),
+                                 (suseconds_t)(idle % 1000) * 1000};
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        }
 
         conn *c = malloc(sizeof *c);
         pthread_mutex_lock(&g_conn_mu);
@@ -485,7 +506,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s [-d dir] [-H host] [-p port] [-s always|batch|none] "
-            "[-n N] [-c ratio] [-m N]\n"
+            "[-n N] [-c ratio] [-m N] [-t secs]\n"
             "  -d  data directory (default ./data)\n"
             "  -H  listen address (default 127.0.0.1)\n"
             "  -p  port (default 7379)\n"
@@ -493,8 +514,10 @@ static void usage(const char *prog)
             "  -n  writes per fsync for -s batch (default 100)\n"
             "  -c  compact in the background once this fraction of the log\n"
             "      is garbage (default 0.5; 0 turns it off)\n"
-            "  -m  most clients served at once (default %d)\n",
-            prog, SERVER_DEFAULT_MAX_CONNS);
+            "  -m  most clients served at once (default %d)\n"
+            "  -t  close a client after this many idle seconds (default %d;\n"
+            "      0 never)\n",
+            prog, SERVER_DEFAULT_MAX_CONNS, SERVER_DEFAULT_IDLE_MS / 1000);
 }
 
 int main(int argc, char **argv)
@@ -504,7 +527,7 @@ int main(int argc, char **argv)
     kv_options o;
     kv_default_options(&o);
     o.auto_compact_ratio = 0.5; /* a long-running server must reclaim space */
-    while ((opt = getopt(argc, argv, "d:H:p:s:n:c:m:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:H:p:s:n:c:m:t:h")) != -1) {
         switch (opt) {
         case 'd':
             dir = optarg;
@@ -535,6 +558,9 @@ int main(int argc, char **argv)
             break;
         case 'm':
             server_set_max_conns((size_t)strtoul(optarg, NULL, 10));
+            break;
+        case 't':
+            server_set_idle_timeout((unsigned)strtoul(optarg, NULL, 10) * 1000);
             break;
         default:
             usage(argv[0]);

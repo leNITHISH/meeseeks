@@ -330,6 +330,47 @@ static void test_large_pipelined_replies(const char *dir)
     free(val);
 }
 
+/* An idle client is disconnected, freeing its slot. */
+static void test_idle_timeout(const char *dir)
+{
+    server_ctx s;
+    int port;
+    server_set_idle_timeout(200);
+    server_set_max_conns(1);
+    CHECK_RC(kv_open(dir, NULL, &s.db), KV_OK);
+    CHECK(server_listen("127.0.0.1", 0, &s.listen_fd, &port) == 0);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, server_thread, &s) == 0);
+
+    client idle;
+    client_connect(&idle, port);
+    client_send(&idle, "GET x\n", 6);
+    expect_line(&idle, "NOT_FOUND"); /* holds the only slot... */
+    char buf[16];
+    CHECK(recv(idle.fd, buf, sizeof buf, 0) == 0); /* ...until timed out */
+    close(idle.fd);
+
+    int served = 0; /* and the slot is free again */
+    for (int tries = 0; tries < 100 && !served; tries++) {
+        client c;
+        client_connect(&c, port);
+        client_send(&c, "GET x\n", 6);
+        char line[64];
+        client_line(&c, line, sizeof line);
+        served = strcmp(line, "NOT_FOUND") == 0;
+        close(c.fd);
+        if (!served)
+            tu_sleep_us(5000);
+    }
+    CHECK(served);
+    server_stop(s.listen_fd);
+    pthread_join(th, NULL);
+    close(s.listen_fd);
+    CHECK_RC(kv_close(s.db), KV_OK);
+    server_set_idle_timeout(SERVER_DEFAULT_IDLE_MS);
+    server_set_max_conns(SERVER_DEFAULT_MAX_CONNS);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN); /* where MSG_NOSIGNAL is missing */
@@ -338,6 +379,7 @@ int main(void)
         {"tcp end-to-end", test_tcp},
         {"connection limit", test_connection_limit},
         {"large pipelined replies", test_large_pipelined_replies},
+        {"idle clients time out", test_idle_timeout},
     };
     return tu_run("test_server", tests, sizeof tests / sizeof *tests);
 }
