@@ -182,7 +182,7 @@ Two problems shaped this design, both found by tests:
 
 | suite | what it does |
 |---|---|
-| `test_kv` | 25 functional tests: every operation, tombstones across restarts, segment rollover, compaction, hint files (and proof that startup really uses them), crash states inside compaction, directory locking across processes, stats, background compaction, CRC-32 and SipHash reference vectors |
+| `test_kv` | 29 functional tests: every operation, tombstones across restarts, segment rollover, compaction (including records larger than its read chunk, and refusing corrupt ones), hint files (and proof that startup really uses them), crash states inside compaction, directory locking across processes, stats, background compaction, CRC-32 and SipHash reference vectors |
 | `test_model` | 24 random runs of 4,000 operations each against an in-memory model: puts, deletes, gets, compactions, reopens, and about 1,000 simulated crashes (the directory is copied while the store is open and the copy recovered) |
 | `test_crash` | 1,000 random truncations, bit flips and torn tails across log and compacted segments, plus 250 damaged hint files and MANIFESTs. The expected state comes from an independent parser of the record format above, and the damaged segment must end exactly at the last good record. |
 | `test_kill` | 100 SIGKILLs at random moments, including mid-compaction, all on one directory. Every acknowledged put (about 160,000 per run) must survive with its exact value. |
