@@ -7,6 +7,7 @@
 #   make test       run the test suite (release build)
 #   make test-asan  run the test suite under ASan/UBSan
 #   make test-tsan  run the concurrent tests under ThreadSanitizer
+#   make coverage   line coverage of src/ by the test suite (gcc + gcov)
 #   make bench      build and run the benchmarks
 #   make fuzz       build the libFuzzer targets (clang) and run each a while
 #   make clean
@@ -34,6 +35,9 @@ else ifeq ($(MODE),asan)
 else ifeq ($(MODE),tsan)
   OPT := -O1 -g -fno-omit-frame-pointer -fsanitize=thread
   LDFLAGS += -fsanitize=thread
+else ifeq ($(MODE),coverage)
+  OPT := -O0 -g --coverage
+  LDFLAGS += --coverage
 else
   $(error unknown MODE '$(MODE)')
 endif
@@ -58,7 +62,7 @@ BENCH   := $(B)/bench
 KVTOOL  := $(B)/kvtool
 LOADGEN := $(B)/loadgen
 
-.PHONY: all debug asan tsan test test-asan test-tsan bench bench-quick fuzz clean
+.PHONY: all debug asan tsan test test-asan test-tsan coverage bench bench-quick fuzz clean
 
 all: $(LIB) $(SERVER) $(KVTOOL) $(TEST_BIN) $(BENCH) $(LOADGEN)
 
@@ -128,6 +132,14 @@ bench: $(BENCH)
 
 bench-quick: $(BENCH)
 	$(BENCH) --dir $(BENCH_DIR) --quick
+
+coverage:
+	rm -f build/coverage/obj/*.gcda
+	$(MAKE) MODE=coverage test
+	@cd build/coverage/obj && for f in $(LIB_SRC:src/%.c=%); do \
+	  gcov -n -o . ../../../src/$$f.c 2>/dev/null | \
+	    awk -v f=$$f '/^Lines executed/ {print f ".c: " $$2 " " $$3 " " $$4; exit}'; \
+	done
 
 # libFuzzer targets (needs clang). make fuzz FUZZ_TIME=<seconds per target>
 FUZZ_CC     ?= clang
