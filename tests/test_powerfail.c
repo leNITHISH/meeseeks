@@ -20,11 +20,16 @@
  * Each image is recovered with the real store, and the result must be the
  * state after some prefix of the operations: at least up to the last one
  * known to be durable, at most up to the one in flight at the cut. The test
- * runs twice: with KV_SYNC_ALWAYS every acknowledged operation is durable;
- * with KV_SYNC_NONE only those before a completed kv_sync() or reopen are,
- * but the store must still never show a state that did not exist (newer
- * records surviving while older ones were lost). Together these check that
- * every fsync and directory fsync the store relies on is issued, in order.
+ * runs three times: with KV_SYNC_ALWAYS every acknowledged operation is
+ * durable; with KV_SYNC_NONE only those before a completed kv_sync() or
+ * reopen are, but the store must still never show a state that did not
+ * exist (newer records surviving while older ones were lost). The third run
+ * starts from a segment with a hole in it: recovery truncates at the hole,
+ * and the new records written afterwards have exactly the size of the old
+ * ones beyond it, so if the truncation were not durable a power cut could
+ * line the stale records up behind the new ones and bring them back.
+ * Together these check that every fsync and directory fsync the store relies
+ * on is issued, in order.
  *
  *   PF_SEED=<n>  workload and image seed      PF_OPS=<n>  ops (default 300)
  */
@@ -67,6 +72,18 @@ typedef struct {
 static op *ops;
 static int nops;
 
+enum { ALIGNED_LEN = 50, INITIAL_RECORDS = 10, HOLE = 3 };
+
+/* Phase 3: puts only, all records the same size as the initial ones. */
+static void gen_aligned_ops(int n)
+{
+    free(ops);
+    ops = calloc((size_t)n, sizeof *ops);
+    nops = n;
+    for (int i = 0; i < n; i++)
+        ops[i] = (op){PUT, (i * 5) % NKEYS, ALIGNED_LEN};
+}
+
 static void gen_ops(uint64_t seed, int n)
 {
     rng_state = seed;
@@ -93,12 +110,12 @@ static void key_name(int k, char *buf)
     snprintf(buf, 16, "key-%02d", k);
 }
 
-static kv_options workload_opts(kv_sync_policy pol)
+static kv_options workload_opts(kv_sync_policy pol, uint64_t segment_size)
 {
     kv_options o;
     kv_default_options(&o);
     o.sync_policy = pol;
-    o.segment_size = 400; /* a rollover every few writes */
+    o.segment_size = segment_size;
     return o;
 }
 
@@ -109,7 +126,8 @@ static int durable_after(kv_sync_policy pol, int i)
            ops[i].kind == REOPEN;
 }
 
-static int run_workload(const char *dir, kv_sync_policy pol)
+static int run_workload(const char *dir, kv_sync_policy pol,
+                        uint64_t segment_size)
 {
     void *self = dlopen(NULL, RTLD_NOW);
     void (*mark)(uint64_t) = NULL;
@@ -117,7 +135,7 @@ static int run_workload(const char *dir, kv_sync_policy pol)
         *(void **)&mark = dlsym(self, "pf_mark");
     if (!mark)
         return 3; /* not running under the recorder */
-    kv_options o = workload_opts(pol);
+    kv_options o = workload_opts(pol, segment_size);
     kv_t *db;
     if (kv_open(dir, &o, &db) != KV_OK)
         return 4;
@@ -235,7 +253,8 @@ static uint8_t *load_log(const char *path, size_t *size)
             r->val = rd64(&p);
             break;
         default:
-            CHECK(!"corrupt recorder log");
+            fprintf(stderr, "corrupt recorder log at byte %td\n", p - b);
+            exit(1);
         }
     }
     return b;
@@ -465,13 +484,14 @@ typedef struct {
     size_t len;
 } kstate;
 
-/* states[k + 1] = every key's state after ops 0..k (states[0]: empty) */
+/* states[k + 1] = every key's state after ops 0..k (states[0]: the start) */
 static kstate (*states)[NKEYS];
 
-static void build_states(void)
+static void build_states(const kstate *start)
 {
     free(states);
     states = calloc((size_t)nops + 1, sizeof *states);
+    memcpy(states[0], start, sizeof states[0]);
     for (int i = 0; i < nops; i++) {
         memcpy(states[i + 1], states[i], sizeof states[i]);
         if (ops[i].kind == PUT)
@@ -557,18 +577,92 @@ static void model_reset(void)
 }
 
 #if !defined(SANITIZED) && defined(__linux__)
-/* Record one workload run and check every crash image of it. */
-static int run_phase(kv_sync_policy pol, uint64_t seed, int nop,
-                     const char *self, const char *shim)
+/* Phase 3's starting point: ten records, the fourth zeroed out. *start gets
+ * the state recovery will find: the three records before the hole. */
+static void make_holey_store(const char *dir, kstate *start)
 {
-    gen_ops(seed, nop);
-    build_states();
+    kv_options o = workload_opts(KV_SYNC_NONE, 1 << 20);
+    kv_t *db;
+    CHECK_RC(kv_open(dir, &o, &db), KV_OK);
+    uint8_t v[ALIGNED_LEN];
+    char k[16];
+    for (int i = 0; i < INITIAL_RECORDS; i++) {
+        key_name(i % NKEYS, k);
+        value_of(1000 + i, v, sizeof v);
+        CHECK_RC(kv_put(db, k, strlen(k), v, sizeof v), KV_OK);
+    }
+    CHECK_RC(kv_close(db), KV_OK);
+    char p[600];
+    snprintf(p, sizeof p, "%s/0000000001-000000.seg", dir);
+    int fd = open(p, O_RDWR);
+    size_t rsz = 20 + strlen(k) + ALIGNED_LEN;
+    uint8_t zero[256] = {0};
+    CHECK(fd >= 0 && rsz <= sizeof zero &&
+          pwrite(fd, zero, rsz, (off_t)(HOLE * rsz)) == (ssize_t)rsz);
+    close(fd);
+    memset(start, 0, NKEYS * sizeof *start);
+    for (int i = 0; i < HOLE; i++)
+        start[i % NKEYS] = (kstate){1, 1000 + i, ALIGNED_LEN};
+}
+
+/* Files that exist before the workload starts are durable as they are. */
+static void model_seed(const char *dir)
+{
+    DIR *d = opendir(dir);
+    CHECK(d != NULL);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.')
+            continue;
+        char p[1024];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        struct stat st;
+        CHECK(stat(p, &st) == 0 && nfiles < MAXFILES);
+        int f = nfiles++;
+        files[f].ino = (uint64_t)st.st_ino;
+        int fd = open(p, O_RDONLY);
+        CHECK(fd >= 0);
+        uint8_t buf[4096];
+        ssize_t n;
+        uint64_t off = 0;
+        while ((n = read(fd, buf, sizeof buf)) > 0) {
+            b_write(&files[f].vol, off, buf, (size_t)n);
+            off += (uint64_t)n;
+        }
+        close(fd);
+        b_copy(&files[f].dur, &files[f].vol);
+        dir_set(&vol_dir, e->d_name, f);
+        dir_set(&dur_dir, e->d_name, f);
+    }
+    closedir(d);
+}
+
+enum { PHASE_ALWAYS, PHASE_NONE, PHASE_ALIGNED };
+static const char *phase_arg[] = {"always", "none", "aligned"};
+static const char *phase_name[] = {"fsync always:", "no fsync:",
+                                   "after a hole:"};
+
+/* Record one workload run and check every crash image of it. */
+static int run_phase(int phase, uint64_t seed, int nop, const char *self,
+                     const char *shim)
+{
+    kv_sync_policy pol = phase == PHASE_ALWAYS ? KV_SYNC_ALWAYS : KV_SYNC_NONE;
+    kstate start[NKEYS];
+    memset(start, 0, sizeof start);
     model_reset();
     char base[256], dir[512], log[512];
     tu_tmpdir(base);
     snprintf(dir, sizeof dir, "%s/store", base);
     snprintf(log, sizeof log, "%s/ops.log", base);
     CHECK(mkdir(dir, 0755) == 0);
+    if (phase == PHASE_ALIGNED) {
+        make_holey_store(dir, start);
+        model_seed(dir);
+        gen_aligned_ops(nop);
+    } else {
+        gen_ops(seed, nop);
+    }
+    build_states(start);
 
     pid_t pid = fork();
     CHECK(pid >= 0);
@@ -578,8 +672,8 @@ static int run_phase(kv_sync_policy pol, uint64_t seed, int nop,
         setenv("LD_PRELOAD", shim, 1);
         setenv("PF_DIR", dir, 1);
         setenv("PF_LOG", log, 1);
-        execl(self, self, "--workload", dir,
-              pol == KV_SYNC_ALWAYS ? "always" : "none", seedarg, (char *)NULL);
+        execl(self, self, "--workload", dir, phase_arg[phase], seedarg,
+              (char *)NULL);
         _exit(127);
     }
     int status;
@@ -606,9 +700,8 @@ static int run_phase(kv_sync_policy pol, uint64_t seed, int nop,
             tu_tmpdir(img);
             build_image(kind, img);
             snprintf(what, sizeof what,
-                     "%s, cut before record %zu/%zu, %s image",
-                     pol == KV_SYNC_ALWAYS ? "fsync always" : "no fsync", i,
-                     nrecs, kind_name[kind]);
+                     "%s cut before record %zu/%zu, %s image",
+                     phase_name[phase], i, nrecs, kind_name[kind]);
             /* a process crash (cached image) loses nothing that was
              * written, so everything acknowledged must be there */
             int ok = check_image(img, kind == IMG_CACHED ? acked : durable,
@@ -636,10 +729,9 @@ static int run_phase(kv_sync_policy pol, uint64_t seed, int nop,
             }
         }
     }
-    printf("  %-13s %ld crash images ok (%zu cut points x %d models; %ld "
+    printf("  %-14s %ld crash images ok (%zu cut points x %d models; %ld "
            "fsyncs, %ld renames)\n",
-           pol == KV_SYNC_ALWAYS ? "fsync always:" : "no fsync:", images,
-           nrecs + 1, NIMG, fsyncs, renames);
+           phase_name[phase], images, nrecs + 1, NIMG, fsyncs, renames);
     free(logbuf);
     free(recs);
     tu_rmrf(dir);
@@ -655,9 +747,14 @@ int main(int argc, char **argv)
     uint64_t seed = s ? strtoull(s, NULL, 0) : 0xF00D;
     int nop = n ? atoi(n) : 300;
     if (argc == 5 && strcmp(argv[1], "--workload") == 0) {
+        if (strcmp(argv[3], "aligned") == 0) {
+            gen_aligned_ops(40);
+            return run_workload(argv[2], KV_SYNC_NONE, 1 << 20);
+        }
         gen_ops(strtoull(argv[4], NULL, 10), nop);
         return run_workload(argv[2], strcmp(argv[3], "always") == 0
-                                         ? KV_SYNC_ALWAYS : KV_SYNC_NONE);
+                                         ? KV_SYNC_ALWAYS : KV_SYNC_NONE,
+                            400 /* a rollover every few writes */);
     }
 #if defined(SANITIZED) || !defined(__linux__)
     (void)argv;
@@ -674,8 +771,9 @@ int main(int argc, char **argv)
     CHECK(access(shim, R_OK) == 0);
     printf("test_powerfail: seed=%llu, %d ops per phase\n",
            (unsigned long long)seed, nop);
-    if (!run_phase(KV_SYNC_ALWAYS, seed, nop, self, shim) ||
-        !run_phase(KV_SYNC_NONE, seed + 1, nop, self, shim))
+    if (!run_phase(PHASE_ALWAYS, seed, nop, self, shim) ||
+        !run_phase(PHASE_NONE, seed + 1, nop, self, shim) ||
+        !run_phase(PHASE_ALIGNED, seed + 2, 40, self, shim))
         return 1;
     model_reset();
     free(states);

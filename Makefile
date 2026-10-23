@@ -141,10 +141,10 @@ fuzz: $(FUZZ_TARGETS:%=build/fuzz/%)
 	  mkdir -p build/fuzz/corpus/$$t; \
 	  echo "== $$t ($(FUZZ_TIME)s)"; \
 	  build/fuzz/$$t -max_total_time=$(FUZZ_TIME) -max_len=2048 \
-	    -print_final_stats=1 build/fuzz/corpus/$$t 2>&1 | \
-	    grep -E "^(Done|stat::number_of_executed_units|stat::new_units_added)|ERROR|SUMMARY" || true; \
-	  test -z "$$(ls crash-* leak-* timeout-* 2>/dev/null)" || \
-	    { echo "fuzzer found a failure:"; ls crash-* leak-* timeout-* 2>/dev/null; exit 1; }; \
+	    -print_final_stats=1 build/fuzz/corpus/$$t > build/fuzz/$$t.log 2>&1 || \
+	    { tail -40 build/fuzz/$$t.log; echo "$$t failed; inputs:"; \
+	      ls crash-* leak-* timeout-* oom-* 2>/dev/null; exit 1; }; \
+	  grep -E "^(Done|stat::new_units_added)" build/fuzz/$$t.log; \
 	done
 
 clean:

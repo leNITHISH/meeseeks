@@ -26,6 +26,25 @@ jobs:
       - name: Benchmark smoke run
         run: make CC=${{ matrix.cc }} bench-quick BENCH_DIR=./bench-data
 
+  fuzz:
+    name: fuzz (libFuzzer, 60 s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lower ASLR entropy for the sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Fuzz
+        run: make fuzz FUZZ_TIME=60
+      - name: Keep any crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+
   sanitizers:
     name: ${{ matrix.mode }}
     runs-on: ubuntu-latest
