@@ -55,10 +55,11 @@ endif
 TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
 BENCH   := $(B)/bench
+KVTOOL  := $(B)/kvtool
 
 .PHONY: all debug asan tsan test test-asan test-tsan bench bench-quick fuzz clean
 
-all: $(LIB) $(SERVER) $(TEST_BIN) $(BENCH)
+all: $(LIB) $(SERVER) $(KVTOOL) $(TEST_BIN) $(BENCH)
 
 debug:
 	$(MAKE) MODE=debug all
@@ -90,6 +91,9 @@ $(B)/test_powerfail: tests/test_powerfail.c tests/test_util.h $(LIB) $(B)/pf_shi
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -ldl -o $@
 
 $(B)/test_%: tests/test_%.c tests/test_util.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(KVTOOL): tools/kvtool.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BENCH): bench/bench.c $(LIB)
