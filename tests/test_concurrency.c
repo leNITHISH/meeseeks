@@ -312,6 +312,98 @@ static void test_compactor_not_starved(const char *dir)
     CHECK_RC(kv_close(db), KV_OK);
 }
 
+/*
+ * Backups taken while a writer and a compactor are busy. Each backup must
+ * hold exactly the state after some prefix of the writer's operations: at
+ * least every put acknowledged before kv_backup() was called, and at most
+ * one past those acknowledged when it returned.
+ */
+enum { BK_KEYS = 64 };
+
+typedef struct {
+    kv_t *db;
+    atomic_int stop, acked;
+} bk_shared;
+
+static void *bk_writer(void *arg)
+{
+    bk_shared *s = arg;
+    char k[16], v[32];
+    for (int i = 0; !atomic_load(&s->stop); i++) {
+        snprintf(k, sizeof k, "k%02d", i % BK_KEYS);
+        snprintf(v, sizeof v, "v%d", i);
+        CHECK_RC(kv_put(s->db, k, strlen(k), v, strlen(v)), KV_OK);
+        atomic_store(&s->acked, i + 1);
+    }
+    return NULL;
+}
+
+static void *bk_compactor(void *arg)
+{
+    bk_shared *s = arg;
+    while (!atomic_load(&s->stop)) {
+        CHECK_RC(kv_compact(s->db), KV_OK);
+        tu_sleep_us(3000);
+    }
+    return NULL;
+}
+
+/* Version held by key k after the first `ops` puts, or -1. */
+static int bk_version(int k, int ops)
+{
+    int last = ops - 1 - ((ops - 1 - k) % BK_KEYS + BK_KEYS) % BK_KEYS;
+    return last >= 0 && last < ops ? last : -1;
+}
+
+static void test_backup_during_writes(const char *dir)
+{
+    kv_options o;
+    kv_default_options(&o);
+    o.sync_policy = KV_SYNC_NONE;
+    o.segment_size = 16 * 1024;
+    bk_shared s = {0};
+    CHECK_RC(kv_open(dir, &o, &s.db), KV_OK);
+    pthread_t w, c;
+    CHECK(pthread_create(&w, NULL, bk_writer, &s) == 0);
+    CHECK(pthread_create(&c, NULL, bk_compactor, &s) == 0);
+    for (int round = 0; round < 5; round++) {
+        tu_sleep_us(20000);
+        char target[512];
+        snprintf(target, sizeof target, "%s-backup%d", dir, round);
+        int lo = atomic_load(&s.acked);
+        CHECK_RC(kv_backup(s.db, target), KV_OK);
+        int hi = atomic_load(&s.acked) + 1;
+
+        kv_t *b;
+        CHECK_RC(kv_open(target, &o, &b), KV_OK);
+        int got[BK_KEYS];
+        for (int k = 0; k < BK_KEYS; k++) {
+            char key[16];
+            void *v;
+            size_t n;
+            snprintf(key, sizeof key, "k%02d", k);
+            int rc = kv_get(b, key, strlen(key), &v, &n);
+            CHECK(rc == KV_OK || rc == KV_NOT_FOUND);
+            got[k] = rc == KV_OK ? atoi((char *)v + 1) : -1;
+            if (rc == KV_OK)
+                free(v);
+        }
+        CHECK_RC(kv_close(b), KV_OK);
+        int match = 0;
+        for (int ops = lo; ops <= hi && !match; ops++) {
+            match = 1;
+            for (int k = 0; k < BK_KEYS && match; k++)
+                match = got[k] == bk_version(k, ops);
+        }
+        CHECK(match);
+        tu_rmrf(target);
+    }
+    atomic_store(&s.stop, 1);
+    pthread_join(w, NULL);
+    pthread_join(c, NULL);
+    CHECK_RC(kv_close(s.db), KV_OK);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -319,6 +411,7 @@ int main(void)
         {"ops complete during compaction", test_ops_during_compaction},
         {"group commit, 8 fsync-always writers", test_group_commit},
         {"compactor not starved by writers", test_compactor_not_starved},
+        {"backups during writes and compactions", test_backup_during_writes},
     };
     return tu_run("test_concurrency", tests, sizeof tests / sizeof *tests);
 }

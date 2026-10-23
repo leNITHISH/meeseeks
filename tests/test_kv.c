@@ -889,6 +889,102 @@ static void test_strerror(const char *dir)
     CHECK(strcmp(kv_strerror(-99), "unknown error") == 0);
 }
 
+/* ---------- backup ---------- */
+
+static void backup_and_check(const char *dir, const char *target)
+{
+    kv_options o = small_opts(8 * 1024);
+    kv_t *db = open_db(dir, &o);
+    fill_overwrites(db, 300, 3);
+    char k[32];
+    for (int i = 0; i < 300; i += 5) {
+        snprintf(k, sizeof k, "key-%05d", i);
+        CHECK_RC(kv_delete(db, k, strlen(k)), KV_OK);
+    }
+    CHECK_RC(kv_compact(db), KV_OK); /* some compacted segments too */
+    fill_overwrites(db, 300, 3);     /* rewrite every key... */
+    for (int i = 0; i < 300; i += 5) {
+        snprintf(k, sizeof k, "key-%05d", i);
+        CHECK_RC(kv_delete(db, k, strlen(k)), KV_OK);
+    }
+    CHECK_RC(kv_backup(db, target), KV_OK);
+    CHECK_RC(kv_backup(db, target), KV_ERR_INVALID); /* must not exist */
+
+    /* the live store moves on: new values, compaction, close */
+    put_s(db, "key-00000", "after the backup");
+    put_s(db, "key-00001", "after the backup");
+    CHECK_RC(kv_compact(db), KV_OK);
+    CHECK_RC(kv_close(db), KV_OK);
+
+    /* the backup holds exactly the state when kv_backup ran */
+    for (int hints = 1; hints >= 0; hints--) {
+        o.use_hints = hints;
+        kv_t *b = open_db(target, &o);
+        check_final_round(b, 300, 3, 5);
+        CHECK(kv_count(b) == 240);
+        CHECK_RC(kv_close(b), KV_OK);
+    }
+    /* writing to the backup must not touch the original's files */
+    kv_t *b = open_db(target, &o);
+    for (int i = 0; i < 200; i++)
+        put_s(b, "only-in-backup", "x");
+    CHECK_RC(kv_close(b), KV_OK);
+    db = open_db(dir, &o);
+    expect(db, "only-in-backup", NULL);
+    expect(db, "key-00000", "after the backup");
+    expect(db, "key-00001", "after the backup");
+    expect(db, "key-00002", "round-2-value-2-padding-padding");
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
+static void test_backup(const char *dir)
+{
+    char target[512];
+    snprintf(target, sizeof target, "%s-backup", dir);
+    backup_and_check(dir, target);
+    tu_rmrf(target);
+}
+
+/* Across file systems nothing can be hard-linked, so everything is copied.
+ * The store lives under $TMPDIR; the backup goes to the working directory,
+ * which is usually elsewhere (if not, this repeats the linked case). */
+static void test_backup_other_filesystem(const char *dir)
+{
+    char target[64];
+    snprintf(target, sizeof target, "meeseeks-backup-%d", (int)getpid());
+    backup_and_check(dir, target);
+    tu_rmrf(target);
+}
+
+/* Right after a backup, the newest segment of both directories is the one
+ * just sealed; both sides append to it when reopened. That file must not
+ * be shared, or each would write into the other. */
+static void test_backup_shares_nothing_writable(const char *dir)
+{
+    char target[512];
+    snprintf(target, sizeof target, "%s-backup", dir);
+    kv_options o = small_opts(1 << 20);
+    kv_t *db = open_db(dir, &o);
+    fill_overwrites(db, 50, 2);
+    CHECK_RC(kv_backup(db, target), KV_OK);
+    CHECK_RC(kv_close(db), KV_OK); /* its fresh active is empty: deleted */
+
+    kv_t *b = open_db(target, &o);
+    put_s(b, "backup-only", "1");
+    CHECK_RC(kv_close(b), KV_OK);
+    db = open_db(dir, &o);
+    put_s(db, "live-only", "2");
+    expect(db, "backup-only", NULL);
+    check_final_round(db, 50, 2, 0);
+    CHECK_RC(kv_close(db), KV_OK);
+    b = open_db(target, &o);
+    expect(b, "live-only", NULL);
+    expect(b, "backup-only", "1");
+    check_final_round(b, 50, 2, 0);
+    CHECK_RC(kv_close(b), KV_OK);
+    tu_rmrf(target);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -921,6 +1017,10 @@ int main(void)
         {"compaction of a record over 1 MiB", test_compact_huge_record},
         {"compaction refuses corrupt records", test_compaction_refuses_corruption},
         {"error strings", test_strerror},
+        {"backup", test_backup},
+        {"backup to another file system", test_backup_other_filesystem},
+        {"backup is isolated from the original",
+         test_backup_shares_nothing_writable},
     };
     return tu_run("test_kv", tests, sizeof tests / sizeof *tests);
 }

@@ -23,7 +23,7 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 ## Contents
 
 - [Quick start](#quick-start)
-- [How it works](#how-it-works): record format, segments, index, writes and durability, recovery, compaction, concurrency
+- [How it works](#how-it-works): record format, segments, index, writes and durability, recovery, compaction, backups, concurrency
 - [Testing](#testing) and the bugs it caught
 - [Benchmarks](#benchmarks)
 - [TCP server](#tcp-server) and [kvtool](#kvtool)
@@ -68,7 +68,7 @@ kv_compact(db);    /* reclaims space; reads and writes keep going */
 kv_close(db);
 ```
 
-`kv_sync()` forces everything written so far to disk and `kv_get_stats()` reports keys, live and dead bytes, fsync count and index memory. One `kv_t` can be shared by any number of threads.
+`kv_sync()` forces everything written so far to disk, `kv_backup()` writes a consistent copy of the store to another directory while it keeps running, and `kv_get_stats()` reports keys, live and dead bytes, fsync count and index memory. One `kv_t` can be shared by any number of threads.
 
 ## How it works
 
@@ -163,6 +163,12 @@ If compaction fails (out of disk, I/O error), the store keeps working. A partly 
 
 `kv_options.auto_compact_ratio` starts a background thread that compacts when dead bytes pass that fraction of the log.
 
+### Backups
+
+`kv_backup(db, dir)` makes a consistent copy of a running store. Sealed segments never change, so no data has to be copied: it seals the active segment, which puts everything acknowledged so far into sealed, durable segments, then hard-links every segment, hint file and the MANIFEST into the new directory. That takes milliseconds whatever the size of the store, and later compactions cannot disturb the backup, since deleting a file only removes one of its names. Across filesystems, where links are impossible, it copies.
+
+One file is always copied: the segment it just sealed. Opening a store appends to its newest log segment, and right after a backup that segment is the newest in both directories, so sharing it would let each store write into the other's file. A test catches exactly that when the file is linked instead. Another takes five backups while a writer and a compactor are running, and checks that each holds exactly the state after some prefix of the writes.
+
 ### Concurrency
 
 There are three locks, always taken in the order compaction mutex, writer mutex, store lock:
@@ -182,14 +188,14 @@ Two problems shaped this design, both found by tests:
 
 | suite | what it does |
 |---|---|
-| `test_kv` | 29 functional tests: every operation, tombstones across restarts, segment rollover, compaction (including records larger than its read chunk, and refusing corrupt ones), hint files (and proof that startup really uses them), crash states inside compaction, directory locking across processes, stats, background compaction, CRC-32 and SipHash reference vectors |
+| `test_kv` | 32 functional tests: every operation, tombstones across restarts, segment rollover, compaction (including records larger than its read chunk, and refusing corrupt ones), hint files (and proof that startup really uses them), crash states inside compaction, backups, directory locking across processes, stats, background compaction, CRC-32 and SipHash reference vectors |
 | `test_model` | 24 random runs of 4,000 operations each against an in-memory model: puts, deletes, gets, compactions, reopens, and about 1,000 simulated crashes (the directory is copied while the store is open and the copy recovered) |
 | `test_crash` | 1,000 random truncations, bit flips and torn tails across log and compacted segments, plus 250 damaged hint files and MANIFESTs. The expected state comes from an independent parser of the record format above, and the damaged segment must end exactly at the last good record. |
 | `test_kill` | 100 SIGKILLs at random moments, including mid-compaction, all on one directory. Every acknowledged put (about 160,000 per run) must survive with its exact value. |
 | `test_faults` | A full disk (via `RLIMIT_FSIZE`) during writes and halfway through a compaction. The torn record must be rolled back, everything acknowledged must stay readable, and a later compaction must succeed. |
 | `test_powerfail` | Power-failure simulation, described below. About 15,600 crash images per run. |
 | `test_fsyncfail` | fsync starts failing with EIO after N calls (an `LD_PRELOAD` shim), for every N from 0 to 80: while opening, on group commits, at segment rollover and inside compaction, with one and four writers. The store must refuse further writes, keep serving reads, release every waiting writer, and lose no acknowledged write once reopened. |
-| `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause |
+| `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause; backups taken mid-write and mid-compaction |
 | `test_server` | The protocol, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 8 concurrent clients, shutdown with clients connected |
 
 **Power-failure checker.** A SIGKILL test keeps the page cache, so it cannot tell whether the right fsyncs happen. `tests/pf_shim.c` is loaded with `LD_PRELOAD` and records every create, write, truncate, fsync, rename and unlink the unmodified library makes in the store directory. `test_powerfail` replays that log through a model of a POSIX filesystem and, at every point in it, builds four images of what the disk could hold after a power cut:
@@ -416,6 +422,7 @@ include/kv.h        public API
 src/kv.c            open/close, writes and group commit, reads, stats
 src/recovery.c      MANIFEST, directory scan, replay, hint loading
 src/compact.c       concurrent compaction
+src/backup.c        online backups with hard links
 src/index.c         hash index (SipHash-1-3, chunked entries)
 src/record.h/.c     record and hint encoding
 src/crc32.c         slice-by-8 CRC-32

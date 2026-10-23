@@ -89,6 +89,12 @@ int kv_compact(kv_t *db);
 /* Make every write so far durable. */
 int kv_sync(kv_t *db);
 
+/* Write a consistent copy of the store, as of this call, to the directory
+ * `path`, which must not exist yet. Files are hard-linked where possible, so
+ * it takes milliseconds regardless of the store's size; the result opens like
+ * any store. Waits for a running compaction to finish. */
+int kv_backup(kv_t *db, const char *path);
+
 /* Flush, fsync and free. Returns the first error seen while closing. */
 int kv_close(kv_t *db);
 
