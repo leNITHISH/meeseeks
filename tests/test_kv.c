@@ -156,7 +156,8 @@ static void test_binary_and_empty(const char *dir)
     const uint8_t key[] = {0, 1, 2, 0, 255};
     const uint8_t val[] = {0, 0, 7, 0, 0, 9};
     CHECK_RC(kv_put(db, key, sizeof key, val, sizeof val), KV_OK);
-    CHECK_RC(kv_put(db, "", 0, "empty key", 9), KV_OK);
+    CHECK_RC(kv_put(db, NULL, 0, "empty key", 9), KV_OK); /* NULL, 0 = "" */
+    CHECK_RC(kv_put(db, "nullval", 7, NULL, 0), KV_OK);
     CHECK_RC(kv_put(db, "empty value", 11, "", 0), KV_OK);
 
     for (int pass = 0; pass < 2; pass++) {
@@ -166,6 +167,10 @@ static void test_binary_and_empty(const char *dir)
         CHECK(n == sizeof val && memcmp(got, val, n) == 0);
         free(got);
         expect(db, "", "empty key");
+        expect(db, "nullval", "");
+        CHECK_RC(kv_get(db, NULL, 0, &got, &n), KV_OK);
+        CHECK(n == 9 && memcmp(got, "empty key", 9) == 0);
+        free(got);
         CHECK_RC(kv_get(db, "empty value", 11, &got, &n), KV_OK);
         CHECK(n == 0 && ((char *)got)[0] == '\0');
         free(got);

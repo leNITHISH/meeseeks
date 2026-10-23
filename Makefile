@@ -145,7 +145,8 @@ fuzz: $(FUZZ_TARGETS:%=build/fuzz/%)
 	  mkdir -p build/fuzz/corpus/$$t; \
 	  echo "== $$t ($(FUZZ_TIME)s)"; \
 	  build/fuzz/$$t -max_total_time=$(FUZZ_TIME) -max_len=2048 \
-	    -print_final_stats=1 build/fuzz/corpus/$$t > build/fuzz/$$t.log 2>&1 || \
+	    -print_final_stats=1 build/fuzz/corpus/$$t fuzz/regressions/$$t \
+	    > build/fuzz/$$t.log 2>&1 || \
 	    { tail -40 build/fuzz/$$t.log; echo "$$t failed; inputs:"; \
 	      ls crash-* leak-* timeout-* oom-* 2>/dev/null; exit 1; }; \
 	  grep -E "^(Done|stat::new_units_added)" build/fuzz/$$t.log; \

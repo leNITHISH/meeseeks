@@ -220,6 +220,8 @@ Bugs I wrote and the suite found:
 - **A 1-second read stall next to a busy writer** (benchmark), described under [Concurrency](#concurrency).
 - **Out-of-order durability across rollover.** While fixing the 82 ms stall I first made the sealing fsync lazy, which let a crash keep newer records while losing older ones. I noticed while designing the power-failure checker, and the checker confirms it: removing that fsync fails the test.
 - **Segment directory entries made durable out of order**, found by the power-failure checker's reorder model, described under [Writes and durability](#writes-and-durability).
+- **A key that could be stored but never read back**, found by `fuzz_protocol` in CI. A key ending in a carriage return was accepted by `SET`, but `GET` puts that carriage return at the end of the line, where it reads as a CRLF line ending, so the lookup used a different key. The protocol now refuses carriage returns in keys and values. The input is kept in `fuzz/regressions/` and replayed on every fuzz run.
+- **A server that never shut down on macOS**, found by CI. The accept loop was woken by calling `shutdown()` on the listening socket, which works on Linux, but on macOS and the BSDs it fails and `accept()` keeps waiting. The loop now waits in `poll()` on the socket and a self-pipe.
 
 ## Benchmarks
 
@@ -345,7 +347,7 @@ GET
 ERR wrong number of arguments for 'GET'
 ```
 
-The value is everything after the single space that follows the key, so it can contain spaces. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection. Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address, and `-c` the fraction of garbage that triggers background compaction (default 0.5, `-c 0` turns it off). SIGINT or SIGTERM closes the store cleanly. In a 6-second soak of 2 KB overwrites, the server took 627,000 puts (about 1.3 GB), compacted 9 times along the way, and ended with 59 MB on disk.
+The value is everything after the single space that follows the key, so it can contain spaces. Keys and values cannot contain a carriage return, which would be indistinguishable from a CRLF line ending. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection. Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address, and `-c` the fraction of garbage that triggers background compaction (default 0.5, `-c 0` turns it off). SIGINT or SIGTERM closes the store cleanly. In a 6-second soak of 2 KB overwrites, the server took 627,000 puts (about 1.3 GB), compacted 9 times along the way, and ended with 59 MB on disk.
 
 Throughput, measured with [`bench/loadgen.c`](bench/loadgen.c) on the laptop described under [Benchmarks](#benchmarks). Client and server share its four hardware threads, the store uses the default fsync policy (every 100 writes), values are 100 bytes, and each row is the best of three 4-second runs:
 
@@ -401,7 +403,7 @@ $ build/release/kvtool check ./data
 - **Durability is only as good as the drive.** A drive that acknowledges flushes it has not done defeats any fsync policy.
 - **Hint-loaded segments are checksummed lazily.** Damage inside them is not noticed at startup; it shows up as `KV_ERR_CORRUPT` on the affected gets, and compaction stops rather than copy it.
 - **Locking is local.** The `fcntl` lock is advisory and not meant for network filesystems.
-- **The server is minimal**: no authentication or TLS, values cannot contain line breaks, and it runs a thread per connection.
+- **The server is minimal**: no authentication or TLS, keys and values cannot contain line breaks, and it runs a thread per connection.
 - **The power-failure checker is Linux-only** and assumes 512-byte sectors are written atomically.
 
 ## Layout

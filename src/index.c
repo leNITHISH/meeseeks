@@ -118,7 +118,7 @@ static void random_key(uint64_t *k0, uint64_t *k1)
             return;
         }
     }
-    struct timespec ts;
+    struct timespec ts = {0, 0};
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t seed[4] = {(uint64_t)ts.tv_sec, (uint64_t)ts.tv_nsec,
                         (uint64_t)getpid(), (uint64_t)(uintptr_t)&ts};

@@ -598,6 +598,10 @@ int kv_put(kv_t *db, const void *key, size_t klen, const void *val, size_t vlen)
     if (!db || (!key && klen) || (!val && vlen) || klen > KV_MAX_KEY_SIZE ||
         vlen > KV_MAX_VALUE_SIZE)
         return KV_ERR_INVALID;
+    /* NULL with length 0 is a valid empty key or value, but memcpy and
+     * memcmp require real pointers even for zero bytes */
+    key = key ? key : "";
+    val = val ? val : "";
     pthread_mutex_lock(&db->write_mu);
     if (atomic_load(&db->failed)) {
         pthread_mutex_unlock(&db->write_mu);
@@ -635,6 +639,7 @@ int kv_delete(kv_t *db, const void *key, size_t klen)
 {
     if (!db || (!key && klen) || klen > KV_MAX_KEY_SIZE)
         return KV_ERR_INVALID;
+    key = key ? key : ""; /* see kv_put */
     pthread_mutex_lock(&db->write_mu);
     if (atomic_load(&db->failed)) {
         pthread_mutex_unlock(&db->write_mu);
@@ -687,6 +692,7 @@ int kv_get(kv_t *db, const void *key, size_t klen, void **val, size_t *vlen)
 {
     if (!db || (!key && klen) || !val || !vlen)
         return KV_ERR_INVALID;
+    key = key ? key : ""; /* see kv_put */
     *val = NULL;
     *vlen = 0;
     kv_read_lock(db);

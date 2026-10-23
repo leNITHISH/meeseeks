@@ -58,6 +58,16 @@ static void test_protocol(const char *dir)
     /* a value stored through the library that the line protocol can't carry */
     CHECK_RC(kv_put(db, "nl", 2, "a\nb", 3), KV_OK);
     exchange(db, "GET nl", "ERR value contains a line break\n");
+
+    /* Carriage returns are refused rather than stored: "GET k\r" would read
+     * as "GET k" with a CRLF ending (found by fuzz_protocol). */
+    exchange(db, "SET k\r v", "ERR key contains a line break\n");
+    exchange(db, "SET k v\rw", "ERR value contains a line break\n");
+    exchange(db, "SET k v\r\r", "ERR value contains a line break\n");
+    exchange(db, "GET k\rx", "ERR key contains a line break\n");
+    exchange(db, "GET k", "NOT_FOUND\n");
+    exchange(db, "SET k v\r", "OK\n"); /* one trailing CR is the line end */
+    exchange(db, "GET k\r", "VALUE v\n");
     CHECK_RC(kv_close(db), KV_OK);
 }
 

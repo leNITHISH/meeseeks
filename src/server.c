@@ -122,12 +122,19 @@ int server_handle_line(kv_t *db, const char *line, size_t len, sbuf *out)
         return reply_err(out, "wrong number of arguments for '%s'", name);
     if (klen > KV_MAX_KEY_SIZE)
         return reply_err(out, "%s", "key too long");
+    /* A carriage return could never be sent back unambiguously: at the end
+     * of a GET line it reads as the CR of a CRLF line ending. So keys and
+     * values that contain one are refused, not stored and then lost. */
+    if (memchr(key, '\r', klen))
+        return reply_err(out, "%s", "key contains a line break");
 
     int rc;
     if (name[0] == 'S') {
         if (i == len) /* no separator after the key, so no value */
             return reply_err(out, "wrong number of arguments for '%s'", name);
         const char *val = line + i + 1;
+        if (memchr(val, '\r', len - i - 1))
+            return reply_err(out, "%s", "value contains a line break");
         rc = kv_put(db, key, klen, val, len - i - 1);
         if (rc == KV_OK)
             return sb_puts(out, "OK\n");

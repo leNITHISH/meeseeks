@@ -15,8 +15,10 @@
  *
  * Keys are a single token without spaces or tabs. The value is the rest of
  * the line after the single space that follows the key, so it may contain
- * spaces and may be empty. Commands are case-insensitive. Requests may be
- * pipelined; responses come back in order.
+ * spaces and may be empty. Neither may contain a carriage return, which
+ * would be indistinguishable from a CRLF line ending. Commands are
+ * case-insensitive. Requests may be pipelined; responses come back in
+ * order.
  */
 
 #define SERVER_MAX_LINE (1u << 20)

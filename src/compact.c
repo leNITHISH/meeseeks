@@ -470,7 +470,10 @@ int kv_compact(kv_t *db)
         kv_unlock(db);
     }
     pthread_mutex_unlock(&db->write_mu);
+    if (rc == KV_OK && nin == 0)
+        rc = KV_ERR_INVALID; /* cannot happen: the seal leaves an input */
     if (rc != KV_OK) {
+        free(inputs);
         pthread_mutex_unlock(&db->compact_mu);
         return rc;
     }
