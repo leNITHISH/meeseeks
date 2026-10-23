@@ -57,9 +57,13 @@ int io_fsync(int fd)
 
 int io_fsync_dir(int dirfd)
 {
-    if (io_fsync(dirfd) == 0)
-        return 0;
-    return errno == EINVAL ? 0 : -1;
+    /* Plain fsync: F_FULLFSYNC is for file data, and the next full sync of
+     * any file flushes the drive cache this directory change sits in. */
+    int rc;
+    do
+        rc = fsync(dirfd);
+    while (rc != 0 && errno == EINTR);
+    return rc == 0 || errno == EINVAL || errno == ENOTSUP ? 0 : -1;
 }
 
 int io_reader_init(io_reader *r, int fd, uint64_t file_size)

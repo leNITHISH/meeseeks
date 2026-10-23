@@ -16,8 +16,8 @@ ssize_t io_read_full(int fd, void *buf, size_t len, off_t off);
 int io_fsync(int fd);
 
 /* Make directory entries (creates, renames, unlinks) durable. Filesystems
- * that cannot fsync a directory report EINVAL; that counts as success,
- * since there is nothing more we could do. 0 or -1. */
+ * that cannot fsync a directory report EINVAL (or ENOTSUP on macOS); that
+ * counts as success, since there is nothing more we could do. 0 or -1. */
 int io_fsync_dir(int dirfd);
 
 /* Sequential reader with a growable window, for replay and compaction. */
