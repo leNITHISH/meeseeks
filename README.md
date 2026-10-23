@@ -96,7 +96,7 @@ A compacted segment has a hint file next to it with one entry per record: key, o
 
 ### Index
 
-An open-addressing hash table maps each key to (segment id, offset, record size). The probe table holds 8-byte slots, each a 32-bit hash and an entry number. Entries are 48 bytes, kept in 16K-entry chunks that never move, and store keys of up to 16 bytes inline, so most keys need no allocation of their own. Lookups compare hashes inside the slot array and touch an entry only on a match, deletion uses backward shifting so there are no tombstones to slow probes down, and growing rehashes without reading any keys. At 1M keys this costs 69 bytes per key; the first version, with 40-byte slots and a malloc per key, used 126.
+An open-addressing hash table maps each key to (segment id, offset, record size). The probe table holds 8-byte slots, each a 32-bit hash and an entry number. Entries are 48 bytes, kept in 16K-entry chunks that never move, and store keys of up to 16 bytes inline, so most keys need no allocation of their own. Lookups compare hashes inside the slot array and touch an entry only on a match, deletion uses backward shifting so there are no tombstones to slow probes down, and growing rehashes without reading any keys. At 1M keys the index takes 66 bytes per key, by its own accounting and by the growth of the resident set alike. The first version, with 40-byte slots and a separate allocation per key, took about 120.
 
 Keys are hashed with SipHash-1-3 under a random per-process key. A plain hash like FNV would let a client of the TCP server send keys that all collide and turn every lookup into a linear scan.
 
@@ -225,7 +225,7 @@ Measured with `make bench` (source in [`bench/bench.c`](bench/bench.c)).
 
 - **Machine:** an Intel Core i3-4005U laptop (2 cores, 4 threads, 1.7 GHz, from 2013) with 8 GB of RAM and a Crucial BX500 240 GB SATA SSD (DRAM-less), btrfs, Linux 7.2.
 - **Setup:** keys are 16 bytes and values 100 bytes unless noted.
-- **Method:** a desktop session with a browser was running, so throughput and startup numbers are the best of three runs. Latency percentiles come from one run of many samples.
+- **Method:** a desktop session with a busy browser was running on the same four hardware threads, so every number is the best of three runs (for the latency sections, the run with the lowest p99.9). Between runs, tails and fsync-bound numbers still move by 20 to 50 percent; medians and throughput without fsync move much less.
 
 BENCHMARK_RESULTS
 
@@ -287,7 +287,7 @@ $ build/release/kvtool check ./data
 
 ## Known limitations
 
-- **The index must fit in RAM**: 69 bytes per key, plus the key itself for keys over 16 bytes. A billion keys would need about 70 GB.
+- **The index must fit in RAM**: 66 bytes per key, plus the key itself for keys over 16 bytes. A billion keys would need about 66 GB.
 - **One writer at a time.** Appends are serialized; group commit only shares the fsyncs.
 - **No range queries or ordered iteration.** The index is a hash table.
 - **Values are read whole.** A get allocates and returns the entire value; values are limited to 256 MiB and keys to 64 KiB.
