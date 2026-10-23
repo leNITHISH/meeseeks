@@ -8,6 +8,7 @@ jobs:
   test:
     name: test (${{ matrix.os }}, ${{ matrix.cc }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25 # a hung test must not hold a runner for hours
     strategy:
       fail-fast: false
       matrix:
@@ -26,9 +27,22 @@ jobs:
       - name: Benchmark smoke run
         run: make CC=${{ matrix.cc }} bench-quick BENCH_DIR=./bench-data
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Line coverage of src/ by the test suite
+        run: make coverage | tee coverage.txt
+      - name: Summary
+        run: |
+          grep -E '\.c: ' coverage.txt >> "$GITHUB_STEP_SUMMARY"
+
   fuzz:
     name: fuzz (libFuzzer, 60 s per target)
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # a hung test must not hold a runner for hours
     steps:
       - uses: actions/checkout@v4
       - name: Lower ASLR entropy for the sanitizers
@@ -48,6 +62,7 @@ jobs:
   sanitizers:
     name: ${{ matrix.mode }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25 # a hung test must not hold a runner for hours
     strategy:
       fail-fast: false
       matrix:
