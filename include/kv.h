@@ -63,6 +63,7 @@ typedef struct {
     uint64_t deletes;     /* since open */
     uint64_t syncs;       /* fsyncs issued for writes (one per group commit) */
     uint64_t compactions; /* since open */
+    uint64_t index_bytes; /* memory held by the in-memory index */
 } kv_stats;
 
 /* Fill opts with defaults: KV_SYNC_EVERY_N (n=100), 64 MiB segments, hints on,

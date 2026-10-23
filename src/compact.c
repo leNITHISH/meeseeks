@@ -313,12 +313,12 @@ static int inputs_unreferenced(kv_t *db, const segment *in, size_t nin)
         ids[i] = in[i].id;
     qsort(ids, nin, sizeof *ids, cmp_u64);
     int ok = 1;
+    size_t cursor = 0;
+    kv_loc *l;
     kv_read_lock(db);
-    for (size_t i = 0; i < db->idx.cap && ok; i++) {
-        const index_slot *s = &db->idx.slots[i];
-        if (s->key && bsearch(&s->loc.seg_id, ids, nin, sizeof *ids, cmp_u64))
+    while (ok && (l = index_next(&db->idx, &cursor)) != NULL)
+        if (bsearch(&l->seg_id, ids, nin, sizeof *ids, cmp_u64))
             ok = 0;
-    }
     kv_unlock(db);
     free(ids);
     return ok;

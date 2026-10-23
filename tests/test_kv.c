@@ -2,6 +2,7 @@
 #include <sys/wait.h>
 
 #include "crc32.h"
+#include "index.h"
 #include "test_util.h"
 
 static kv_options small_opts(uint64_t segment_size)
@@ -81,6 +82,42 @@ static void test_crc32(const char *dir)
     for (size_t cut = 0; cut <= sizeof buf; cut += 37)
         CHECK(crc32_update(crc32_update(0, buf, cut), buf + cut,
                            sizeof buf - cut) == crc_reference(buf, sizeof buf));
+}
+
+static void test_siphash(const char *dir)
+{
+    (void)dir;
+    /* reference vectors for SipHash-2-4, key 00 01 .. 0f, message 00 01 .. */
+    uint8_t msg[64];
+    for (int i = 0; i < 64; i++)
+        msg[i] = (uint8_t)i;
+    uint64_t k0 = 0x0706050403020100ull, k1 = 0x0f0e0d0c0b0a0908ull;
+    CHECK(siphash(msg, 0, k0, k1, 2, 4) == 0x726fdb47dd0e0e31ull);
+    CHECK(siphash(msg, 1, k0, k1, 2, 4) == 0x74f839c593dc67fdull);
+    CHECK(siphash(msg, 15, k0, k1, 2, 4) == 0xa129ca6149be45e5ull);
+
+    /* the index's unrolled SipHash-1-3 agrees with the generic one: a
+     * lookup with the hash it would compute must land on the right key */
+    kv_index idx;
+    CHECK(index_init(&idx, 16) == 0);
+    for (size_t len = 0; len <= 40; len++) {
+        int existed;
+        kv_loc *l = index_upsert(&idx, msg, len, &existed);
+        CHECK(l && !existed);
+        l->offset = len;
+        CHECK(idx.slots != NULL);
+        uint32_t h = (uint32_t)siphash(msg, len, idx.k0, idx.k1, 1, 3);
+        int found = 0;
+        for (size_t i = 0; i < idx.cap; i++)
+            if (idx.slots[i] && (uint32_t)(idx.slots[i] >> 32) == h)
+                found = 1;
+        CHECK(found);
+    }
+    for (size_t len = 0; len <= 40; len++) {
+        kv_loc *l = index_get(&idx, msg, len);
+        CHECK(l && l->offset == len);
+    }
+    index_free(&idx);
 }
 
 /* ---------- basic operations ---------- */
@@ -742,6 +779,7 @@ int main(void)
 {
     static const test_case tests[] = {
         {"crc32 known answers", test_crc32},
+        {"siphash reference vectors", test_siphash},
         {"put/get/overwrite", test_put_get},
         {"delete", test_delete},
         {"binary keys, empty key and value", test_binary_and_empty},

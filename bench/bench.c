@@ -8,6 +8,10 @@
  * mixed, memory
  * (default: all). DIR defaults to ./bench-data and should be on the disk you
  * want to measure (not tmpfs). --quick shrinks every workload for a smoke run.
+ *
+ * Throughput and startup numbers are the best of TRIALS runs, which filters
+ * out interference from whatever else the machine is doing; latency
+ * percentiles come from a single run of many samples.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -35,6 +39,8 @@
 
 static const char *g_dir = "./bench-data";
 static int g_quick;
+
+#define TRIALS 3
 
 /* ---------- helpers ---------- */
 
@@ -180,11 +186,17 @@ static void bench_write(void)
     };
     for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
         uint64_t ops = g_quick ? cases[c].ops / 50 : cases[c].ops;
-        kv_t *db = fresh(cases[c].pol, cases[c].n);
-        uint64_t t0 = now_ns();
-        load(db, ops, VAL_LEN);
-        uint64_t dt = now_ns() - t0;
-        kv_close(db);
+        uint64_t dt = UINT64_MAX;
+        int trials = cases[c].pol == KV_SYNC_ALWAYS ? 1 : TRIALS;
+        for (int t = 0; t < trials; t++) {
+            kv_t *db = fresh(cases[c].pol, cases[c].n);
+            uint64_t t0 = now_ns();
+            load(db, ops, VAL_LEN);
+            uint64_t d = now_ns() - t0;
+            kv_close(db);
+            if (d < dt)
+                dt = d;
+        }
         printf("| %s | %llu | %.0f | %.1f us |\n", cases[c].name,
                (unsigned long long)ops, (double)ops * 1e9 / (double)dt,
                (double)dt / 1000.0 / (double)ops);
@@ -416,9 +428,14 @@ static void bench_startup(void)
         for (int hints = 1; hints >= 0; hints--) {
             if (!cold)
                 time_open(hints, 0, &keys); /* warm the cache first */
-            double ms = time_open(hints, cold, &keys);
-            if (keys != nkeys)
-                die("startup key count", KV_ERR_CORRUPT);
+            double ms = 1e30;
+            for (int t = 0; t < TRIALS; t++) {
+                double m = time_open(hints, cold, &keys);
+                if (m < ms)
+                    ms = m;
+                if (keys != nkeys)
+                    die("startup key count", KV_ERR_CORRUPT);
+            }
             printf("| %s | %s | %.0f ms |\n",
                    hints ? "hint files" : "full replay of segments",
                    cold ? "cold" : "warm", ms);
@@ -458,7 +475,7 @@ static void *reader_main(void *p)
 static void bench_readers(void)
 {
     uint64_t nkeys = g_quick ? 10000 : 1000000;
-    double secs = g_quick ? 0.2 : 3.0;
+    double secs = g_quick ? 0.2 : 1.5;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     printf("\n### Read throughput vs reader threads (%lluk keys, warm, "
            "%ld hardware threads)\n\n",
@@ -469,24 +486,31 @@ static void bench_readers(void)
     load(db, nkeys, VAL_LEN);
     double base = 0;
     for (int t = 1; t <= 8; t *= 2) {
-        atomic_int stop = 0;
-        pthread_t th[8];
-        rd_arg args[8];
-        for (int i = 0; i < t; i++) {
-            args[i] = (rd_arg){db, nkeys, 0x9E3779B97F4A7C15ull * (uint64_t)(i + 1),
-                               0, &stop};
-            pthread_create(&th[i], NULL, reader_main, &args[i]);
+        double rate = 0;
+        for (int trial = 0; trial < TRIALS; trial++) {
+            atomic_int stop = 0;
+            pthread_t th[8];
+            rd_arg args[8];
+            for (int i = 0; i < t; i++) {
+                args[i] = (rd_arg){db, nkeys,
+                                   0x9E3779B97F4A7C15ull * (uint64_t)(i + 1), 0,
+                                   &stop};
+                pthread_create(&th[i], NULL, reader_main, &args[i]);
+            }
+            struct timespec ts = {(time_t)secs,
+                                  (long)((secs - (double)(time_t)secs) * 1e9)};
+            uint64_t t0 = now_ns();
+            nanosleep(&ts, NULL);
+            atomic_store(&stop, 1);
+            uint64_t total = 0;
+            for (int i = 0; i < t; i++) {
+                pthread_join(th[i], NULL);
+                total += args[i].ops;
+            }
+            double r = (double)total * 1e9 / (double)(now_ns() - t0);
+            if (r > rate)
+                rate = r;
         }
-        struct timespec ts = {(time_t)secs, (long)((secs - (double)(time_t)secs) * 1e9)};
-        uint64_t t0 = now_ns();
-        nanosleep(&ts, NULL);
-        atomic_store(&stop, 1);
-        uint64_t total = 0;
-        for (int i = 0; i < t; i++) {
-            pthread_join(th[i], NULL);
-            total += args[i].ops;
-        }
-        double rate = (double)total * 1e9 / (double)(now_ns() - t0);
         if (t == 1)
             base = rate;
         printf("| %d | %.0f | %.2fx |\n", t, rate, rate / base);

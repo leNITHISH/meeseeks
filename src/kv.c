@@ -748,6 +748,7 @@ void kv_get_stats(kv_t *db, kv_stats *st)
     st->puts = db->nputs;
     st->deletes = db->ndeletes;
     st->compactions = db->ncompactions;
+    st->index_bytes = index_memory(&db->idx);
     kv_unlock(db);
     pthread_mutex_lock(&db->sync_mu);
     st->syncs = db->nsyncs;
