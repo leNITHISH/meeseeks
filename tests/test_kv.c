@@ -1,6 +1,7 @@
 /* Functional tests for the public API. */
 #include <sys/wait.h>
 
+#include "crc32.h"
 #include "test_util.h"
 
 static kv_options small_opts(uint64_t segment_size)
@@ -43,6 +44,43 @@ static kv_t *open_db(const char *dir, const kv_options *o)
     kv_t *db;
     CHECK_RC(kv_open(dir, o, &db), KV_OK);
     return db;
+}
+
+/* ---------- checksum ---------- */
+
+static uint32_t crc_reference(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    while (n--) {
+        c ^= *p++;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+    }
+    return ~c;
+}
+
+static void test_crc32(const char *dir)
+{
+    (void)dir;
+    /* the standard check value of CRC-32/ISO-HDLC (zlib, PNG, Ethernet) */
+    CHECK(crc32_update(0, "123456789", 9) == 0xCBF43926u);
+    CHECK(crc32_update(0, "", 0) == 0);
+    uint8_t buf[1000];
+    uint64_t x = 88172645463325252ull;
+    for (size_t i = 0; i < sizeof buf; i++) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        buf[i] = (uint8_t)x;
+    }
+    /* every length and alignment against the bit-at-a-time definition */
+    for (size_t off = 0; off < 8; off++)
+        for (size_t n = 0; n + off <= 300; n++)
+            CHECK(crc32_update(0, buf + off, n) == crc_reference(buf + off, n));
+    /* chaining two calls equals one call over the concatenation */
+    for (size_t cut = 0; cut <= sizeof buf; cut += 37)
+        CHECK(crc32_update(crc32_update(0, buf, cut), buf + cut,
+                           sizeof buf - cut) == crc_reference(buf, sizeof buf));
 }
 
 /* ---------- basic operations ---------- */
@@ -703,6 +741,7 @@ static void test_bad_options(const char *dir)
 int main(void)
 {
     static const test_case tests[] = {
+        {"crc32 known answers", test_crc32},
         {"put/get/overwrite", test_put_get},
         {"delete", test_delete},
         {"binary keys, empty key and value", test_binary_and_empty},

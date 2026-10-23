@@ -434,18 +434,21 @@ int kv_recover(kv_t *db)
 
     /* Keep appending to the newest segment if it is a log segment with room
      * left; compaction outputs are never appended to. */
-    if (db->nsegs && SEG_SUB(seg_active(db)->id) == 0 &&
-        seg_active(db)->size < db->opts.segment_size)
-        return KV_OK;
-    if (db->next_log > SEG_MAX_LOG)
-        return KV_ERR_IO;
-    segment s = {.id = SEG_ID(db->next_log, 0)};
-    if (seg_create(db, s.id, &s.fd) != 0)
-        return KV_ERR_IO;
-    if (seg_insert(db, &s) != 0) {
-        close(s.fd);
-        return KV_ERR_NOMEM;
+    if (!db->nsegs || SEG_SUB(seg_active(db)->id) != 0 ||
+        seg_active(db)->size >= db->opts.segment_size) {
+        if (db->next_log > SEG_MAX_LOG)
+            return KV_ERR_IO;
+        segment s = {.id = SEG_ID(db->next_log, 0)};
+        if (seg_create(db, s.id, &s.fd, 1) != 0)
+            return KV_ERR_IO;
+        if (seg_insert(db, &s) != 0) {
+            close(s.fd);
+            return KV_ERR_NOMEM;
+        }
+        db->next_log++;
     }
-    db->next_log++;
+    db->act_fd = seg_active(db)->fd;
+    db->act_id = seg_active(db)->id;
+    db->act_size = seg_active(db)->size;
     return KV_OK;
 }

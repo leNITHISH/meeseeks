@@ -16,6 +16,10 @@ WARN    := -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion \
            -Wstrict-prototypes -Wmissing-prototypes
 CPPFLAGS:= -Iinclude -Isrc -D_POSIX_C_SOURCE=200809L
 LDLIBS  := -lpthread
+# macOS hides its extensions (F_FULLFSYNC, sysctlbyname) under strict POSIX
+ifeq ($(shell uname -s),Darwin)
+  CPPFLAGS += -D_DARWIN_C_SOURCE
+endif
 
 MODE ?= release
 ifeq ($(MODE),release)
@@ -48,9 +52,9 @@ TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
 BENCH   := $(B)/bench
 
-.PHONY: all debug asan tsan test test-asan test-tsan bench clean
+.PHONY: all debug asan tsan test test-asan test-tsan bench bench-quick clean
 
-all: $(LIB) $(SERVER) $(TEST_BIN)
+all: $(LIB) $(SERVER) $(TEST_BIN) $(BENCH)
 
 debug:
 	$(MAKE) MODE=debug all
@@ -97,8 +101,13 @@ test-tsan:
 	  TSAN_OPTIONS=halt_on_error=1 KILL_ROUNDS=30 build/tsan/$$t; done
 	@echo "all tests passed (tsan)"
 
+# Run on the disk you want to measure: make bench BENCH_DIR=/path/on/disk
+BENCH_DIR ?= ./bench-data
 bench: $(BENCH)
-	$(BENCH)
+	$(BENCH) --dir $(BENCH_DIR)
+
+bench-quick: $(BENCH)
+	$(BENCH) --dir $(BENCH_DIR) --quick
 
 clean:
 	rm -rf build

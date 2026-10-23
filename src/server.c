@@ -16,6 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0 /* not on every platform; SIGPIPE is ignored instead */
+#endif
+
 /* ---------- output buffer ---------- */
 
 void sbuf_free(sbuf *b)

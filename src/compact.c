@@ -43,6 +43,9 @@
 #include "record.h"
 
 #define CHUNK_BYTES (1u << 20)
+/* Index operations per lock hold: bounds how long one compaction step can
+ * make a writer (read lock) or a reader (write lock) wait. */
+#define LOCK_BATCH 512
 
 typedef struct {
     uint64_t off; /* offset in the input segment */
@@ -387,16 +390,18 @@ static int compact_input(compactor *c, const segment *in)
         }
 
         /* b. Which records are live? */
-        kv_read_lock(db);
         for (size_t i = 0; i < c->nrecs; i++) {
+            if (i % LOCK_BATCH == 0)
+                kv_read_lock(db);
             chunk_rec *cr = &c->recs[i];
             kv_loc *l = cr->tomb ? NULL
                                  : index_get(&db->idx,
                                              base + (cr->off - off) + REC_HDR_SIZE,
                                              cr->ksz);
             cr->live = l && l->seg_id == in->id && l->offset == cr->off;
+            if (i % LOCK_BATCH == LOCK_BATCH - 1 || i + 1 == c->nrecs)
+                kv_unlock(db);
         }
-        kv_unlock(db);
 
         /* c. Copy them. */
         c->nredirs = 0;
@@ -412,15 +417,21 @@ static int compact_input(compactor *c, const segment *in)
          * copies that reached the file count: the latest output has
          * c->size bytes written (even if finishing it failed), earlier
          * ones were flushed in full before the switch. */
-        kv_write_lock(db);
         for (size_t i = 0; i < c->nredirs; i++) {
+            if (i % LOCK_BATCH == 0)
+                kv_write_lock(db);
             redirect *d = &c->redirs[i];
-            if (d->to.seg_id == c->id && d->to.offset + d->to.rec_size > c->size)
-                continue;
-            kv_loc *l = index_get(&db->idx, d->key, d->ksz);
-            if (l && l->seg_id == d->from.seg_id && l->offset == d->from.offset)
-                *l = d->to;
+            if (d->to.seg_id != c->id ||
+                d->to.offset + d->to.rec_size <= c->size) {
+                kv_loc *l = index_get(&db->idx, d->key, d->ksz);
+                if (l && l->seg_id == d->from.seg_id &&
+                    l->offset == d->from.offset)
+                    *l = d->to;
+            }
+            if (i % LOCK_BATCH == LOCK_BATCH - 1 || i + 1 == c->nredirs)
+                kv_unlock(db);
         }
+        kv_write_lock(db);
         if (c->open) {
             segment *s = seg_find(db, c->id);
             if (s)
@@ -441,19 +452,23 @@ int kv_compact(kv_t *db)
         return KV_ERR_FAILED;
     pthread_mutex_lock(&db->compact_mu);
 
-    /* 1. Seal. */
-    kv_write_lock(db);
+    /* 1. Seal. Holding write_mu keeps writers out until the new active
+     * segment is in place, so the input set is exactly what precedes it. */
+    pthread_mutex_lock(&db->write_mu);
     int rc = seg_rollover(db);
-    size_t nin = rc == KV_OK ? db->nsegs - 1 : 0;
+    size_t nin = 0;
     segment *inputs = NULL;
     if (rc == KV_OK) {
+        kv_read_lock(db);
+        nin = db->nsegs - 1;
         inputs = malloc((nin ? nin : 1) * sizeof *inputs);
         if (inputs)
             memcpy(inputs, db->segs, nin * sizeof *inputs);
         else
             rc = KV_ERR_NOMEM;
+        kv_unlock(db);
     }
-    kv_unlock(db);
+    pthread_mutex_unlock(&db->write_mu);
     if (rc != KV_OK) {
         pthread_mutex_unlock(&db->compact_mu);
         return rc;

@@ -67,7 +67,7 @@ int seg_insert(kv_t *db, const segment *s)
     return 0;
 }
 
-int seg_create(kv_t *db, uint64_t id, int *fd_out)
+int seg_create(kv_t *db, uint64_t id, int *fd_out, int sync_dir)
 {
     char name[SEG_NAME_MAX];
     /* an appendable segment must never be paired with a stale hint */
@@ -78,7 +78,7 @@ int seg_create(kv_t *db, uint64_t id, int *fd_out)
                     0644);
     if (fd < 0)
         return -1;
-    if (io_fsync_dir(db->dirfd) != 0) {
+    if (sync_dir && io_fsync_dir(db->dirfd) != 0) {
         close(fd);
         unlinkat(db->dirfd, name, 0);
         return -1;
@@ -97,35 +97,31 @@ void kv_set_failed(kv_t *db)
 
 int seg_rollover(kv_t *db)
 {
-    /* Sealed segments are always durable. Group commit relies on this: a
-     * leader only has to fsync the active segment. */
-    if (io_fsync(seg_active(db)->fd) != 0) {
-        kv_set_failed(db);
-        return KV_ERR_FAILED;
-    }
-    pthread_mutex_lock(&db->sync_mu);
-    db->nsyncs++;
-    if (db->written_lsn > db->durable_lsn) {
-        db->durable_lsn = db->written_lsn;
-        pthread_cond_broadcast(&db->sync_cv);
-    }
-    pthread_mutex_unlock(&db->sync_mu);
-    db->unsynced = 0;
-
     if (db->next_log > SEG_MAX_LOG)
         return KV_ERR_IO;
     segment s = {.id = SEG_ID(db->next_log, 0)};
-    if (seg_create(db, s.id, &s.fd) != 0)
+    if (seg_create(db, s.id, &s.fd, 0) != 0)
         return KV_ERR_IO;
-    if (seg_insert(db, &s) != 0) {
+    kv_write_lock(db);
+    int rc = seg_insert(db, &s) == 0 ? KV_OK : KV_ERR_NOMEM;
+    if (rc == KV_OK) {
+        /* seal the old active segment: it may still hold unsynced bytes */
+        db->segs[db->nsegs - 2].end_lsn = db->written_lsn;
+        db->dir_gen++;
+        kv_maybe_kick_compactor(db);
+    }
+    kv_unlock(db);
+    if (rc != KV_OK) {
         char name[SEG_NAME_MAX];
         seg_name(name, sizeof name, s.id, "seg");
         close(s.fd);
         unlinkat(db->dirfd, name, 0);
-        return KV_ERR_NOMEM;
+        return rc;
     }
     db->next_log++;
-    kv_maybe_kick_compactor(db);
+    db->act_fd = s.fd;
+    db->act_id = s.id;
+    db->act_size = 0;
     return KV_OK;
 }
 
@@ -298,6 +294,7 @@ static void free_db(kv_t *db)
     pthread_mutex_destroy(&db->sync_mu);
     pthread_mutex_destroy(&db->turnstile);
     pthread_rwlock_destroy(&db->lock);
+    pthread_mutex_destroy(&db->write_mu);
     free(db);
 }
 
@@ -305,6 +302,7 @@ static int init_sync(kv_t *db)
 {
     /* Initialize every primitive up front so free_db can destroy them all. */
     int bad = 0;
+    bad |= pthread_mutex_init(&db->write_mu, NULL);
     bad |= pthread_rwlock_init(&db->lock, NULL);
     bad |= pthread_mutex_init(&db->turnstile, NULL);
     bad |= pthread_mutex_init(&db->sync_mu, NULL);
@@ -392,11 +390,11 @@ int kv_close(kv_t *db)
         db->bg_running = 0;
     }
     int rc = KV_OK;
-    segment *a = seg_active(db);
     if (atomic_load(&db->failed))
         rc = KV_ERR_FAILED;
-    else if (io_fsync(a->fd) != 0)
-        rc = KV_ERR_IO;
+    else
+        rc = kv_sync_all(db);
+    segment *a = seg_active(db);
     if (a->size == 0) {
         /* don't leave an empty segment behind */
         char name[SEG_NAME_MAX];
@@ -436,15 +434,26 @@ static int ensure_wbuf(kv_t *db, uint64_t n)
     return 0;
 }
 
-/* Append one record to the active segment. Write lock held. On success *loc
- * is where it landed and *lsn the log position just past it. */
-static int append_locked(kv_t *db, const void *key, uint32_t ksz,
-                         const void *val, uint32_t vsz, kv_loc *loc,
-                         uint64_t *lsn)
+/* Drop bytes past the last published record: a torn or unpublished append.
+ * If even that fails, the next append overwrites them in place (appends
+ * always go to act_size), and replay truncates whatever is left past the
+ * last good record. */
+static void cut_tail(kv_t *db)
+{
+    int unused = ftruncate(db->act_fd, (off_t)db->act_size);
+    (void)unused;
+}
+
+/*
+ * Write one record at the end of the active segment, rolling over first if
+ * it is full. write_mu held, `lock` not: this is the part that can block.
+ * The record stays invisible until publish_locked().
+ */
+static int append(kv_t *db, const void *key, uint32_t ksz, const void *val,
+                  uint32_t vsz, kv_loc *loc)
 {
     uint64_t rsz = record_size(ksz, vsz);
-    if (seg_active(db)->size > 0 &&
-        seg_active(db)->size + rsz > db->opts.segment_size) {
+    if (db->act_size > 0 && db->act_size + rsz > db->opts.segment_size) {
         int rc = seg_rollover(db);
         if (rc != KV_OK)
             return rc;
@@ -452,26 +461,28 @@ static int append_locked(kv_t *db, const void *key, uint32_t ksz,
     if (ensure_wbuf(db, rsz) != 0)
         return KV_ERR_NOMEM;
     record_encode(db->wbuf, now_ts(db), key, ksz, val, vsz);
-
-    segment *a = seg_active(db);
-    if (io_write_all(a->fd, db->wbuf, (size_t)rsz, (off_t)a->size) != 0) {
-        /* Cut off any partial tail. If even that fails, the next append
-         * overwrites it in place (we always write at a->size), and replay
-         * truncates whatever is left past the last good record. */
-        int unused = ftruncate(a->fd, (off_t)a->size);
-        (void)unused;
+    if (io_write_all(db->act_fd, db->wbuf, (size_t)rsz, (off_t)db->act_size) !=
+        0) {
+        cut_tail(db);
         return KV_ERR_IO;
     }
-    loc->seg_id = a->id;
-    loc->offset = a->size;
+    loc->seg_id = db->act_id;
+    loc->offset = db->act_size;
     loc->rec_size = (uint32_t)rsz;
-    a->size += rsz;
-    db->written_lsn += rsz;
-    *lsn = db->written_lsn;
     return KV_OK;
 }
 
-/* Must this write wait for an fsync? Write lock held. */
+/* Make an appended record part of the log. write_mu and `lock` held.
+ * Returns the log position just past it. */
+static uint64_t publish_locked(kv_t *db, uint64_t rsz)
+{
+    db->act_size += rsz;
+    seg_active(db)->size = db->act_size;
+    db->written_lsn += rsz;
+    return db->written_lsn;
+}
+
+/* Must this write wait for an fsync? write_mu held. */
 static int needs_sync(kv_t *db)
 {
     switch (db->opts.sync_policy) {
@@ -486,6 +497,53 @@ static int needs_sync(kv_t *db)
     default:
         return 0;
     }
+}
+
+/*
+ * The leader's fsync. Every byte from `from` up to the current log position
+ * lives in the active segment or in a segment sealed since then (end_lsn >
+ * from), or it was copied into a compaction output, which is fsynced before
+ * its input is retired. Sync all of those, plus the directory if new segment
+ * files appeared. The fds are dup'ed under the read lock so a concurrent
+ * compaction can close the originals without pulling them out from under us.
+ *
+ * Returns 1 on success, with the covered log position in *target; 0 if an
+ * fsync failed; -1 if we ran out of descriptors or memory (nothing synced).
+ */
+static int leader_sync(kv_t *db, uint64_t from, uint64_t synced_dir,
+                       uint64_t *target, uint64_t *dir_gen)
+{
+    kv_read_lock(db);
+    *target = db->written_lsn;
+    *dir_gen = db->dir_gen;
+    int *fds = malloc((db->nsegs + 1) * sizeof *fds);
+    int nfds = 0, rc = fds ? 1 : -1;
+    for (size_t i = 0; rc == 1 && i < db->nsegs; i++) {
+        const segment *s = &db->segs[i];
+        if (i + 1 == db->nsegs || s->end_lsn > from) {
+            if ((fds[nfds] = dup(s->fd)) < 0)
+                rc = -1;
+            else
+                nfds++;
+        }
+    }
+    int dirfd = -1;
+    if (rc == 1 && *dir_gen != synced_dir && (dirfd = dup(db->dirfd)) < 0)
+        rc = -1;
+    kv_unlock(db);
+
+    for (int i = 0; i < nfds; i++) {
+        if (rc == 1 && io_fsync(fds[i]) != 0)
+            rc = 0;
+        close(fds[i]);
+    }
+    if (dirfd >= 0) {
+        if (rc == 1 && io_fsync_dir(dirfd) != 0)
+            rc = 0;
+        close(dirfd);
+    }
+    free(fds);
+    return rc;
 }
 
 /*
@@ -511,27 +569,27 @@ static int wait_durable(kv_t *db, uint64_t lsn)
             continue;
         }
         db->syncing = 1;
+        uint64_t from = db->durable_lsn, synced_dir = db->durable_dir;
         pthread_mutex_unlock(&db->sync_mu);
 
-        /* Snapshot the log position and the active segment. Bytes below
-         * target are either in that segment or in sealed segments, which
-         * rollover already made durable. The dup keeps the descriptor valid
-         * even if the segment is sealed and compacted away meanwhile. */
-        kv_read_lock(db);
-        uint64_t target = db->written_lsn;
-        int fd = dup(seg_active(db)->fd);
-        kv_unlock(db);
-        int ok = fd >= 0 && io_fsync(fd) == 0;
-        if (fd >= 0)
-            close(fd);
+        uint64_t target, dir_gen;
+        int ok = leader_sync(db, from, synced_dir, &target, &dir_gen);
 
         pthread_mutex_lock(&db->sync_mu);
         db->syncing = 0;
-        db->nsyncs++;
-        if (ok && target > db->durable_lsn)
-            db->durable_lsn = target;
+        if (ok == 1) {
+            db->nsyncs++;
+            if (target > db->durable_lsn)
+                db->durable_lsn = target;
+            if (dir_gen > db->durable_dir)
+                db->durable_dir = dir_gen;
+        }
         pthread_cond_broadcast(&db->sync_cv);
-        if (!ok) {
+        if (ok == -1) {
+            rc = KV_ERR_NOMEM; /* nothing was claimed durable; retryable */
+            break;
+        }
+        if (ok == 0) {
             pthread_mutex_unlock(&db->sync_mu);
             kv_set_failed(db);
             return KV_ERR_FAILED;
@@ -546,36 +604,36 @@ int kv_put(kv_t *db, const void *key, size_t klen, const void *val, size_t vlen)
     if (!db || (!key && klen) || (!val && vlen) || klen > KV_MAX_KEY_SIZE ||
         vlen > KV_MAX_VALUE_SIZE)
         return KV_ERR_INVALID;
-    if (atomic_load(&db->failed))
+    pthread_mutex_lock(&db->write_mu);
+    if (atomic_load(&db->failed)) {
+        pthread_mutex_unlock(&db->write_mu);
         return KV_ERR_FAILED;
-    kv_write_lock(db);
-    /* Reserve the index slot first so that a failed append can be undone
-     * and a failed allocation leaves nothing on disk. */
-    int existed;
-    kv_loc *slot = index_upsert(&db->idx, key, klen, &existed);
-    if (!slot) {
-        kv_unlock(db);
-        return KV_ERR_NOMEM;
     }
-    kv_loc old = *slot, loc;
+    kv_loc loc;
     uint64_t lsn = 0;
     int sync = 0;
-    int rc = append_locked(db, key, (uint32_t)klen, val, (uint32_t)vlen, &loc,
-                           &lsn);
-    if (rc != KV_OK) {
-        if (existed)
-            *slot = old;
-        else
-            index_remove(&db->idx, key, klen, NULL);
-    } else {
-        *slot = loc;
-        if (existed)
-            db->live_bytes -= old.rec_size;
-        db->live_bytes += loc.rec_size;
-        db->nputs++;
-        sync = needs_sync(db);
+    int rc = append(db, key, (uint32_t)klen, val, (uint32_t)vlen, &loc);
+    if (rc == KV_OK) {
+        kv_write_lock(db);
+        int existed;
+        kv_loc *slot = index_upsert(&db->idx, key, klen, &existed);
+        if (slot) {
+            if (existed)
+                db->live_bytes -= slot->rec_size;
+            *slot = loc;
+            db->live_bytes += loc.rec_size;
+            db->nputs++;
+            lsn = publish_locked(db, loc.rec_size);
+        }
+        kv_unlock(db);
+        if (slot) {
+            sync = needs_sync(db);
+        } else {
+            cut_tail(db); /* never published: take it back off the disk */
+            rc = KV_ERR_NOMEM;
+        }
     }
-    kv_unlock(db);
+    pthread_mutex_unlock(&db->write_mu);
     return rc == KV_OK && sync ? wait_durable(db, lsn) : rc;
 }
 
@@ -583,40 +641,50 @@ int kv_delete(kv_t *db, const void *key, size_t klen)
 {
     if (!db || (!key && klen) || klen > KV_MAX_KEY_SIZE)
         return KV_ERR_INVALID;
-    if (atomic_load(&db->failed))
+    pthread_mutex_lock(&db->write_mu);
+    if (atomic_load(&db->failed)) {
+        pthread_mutex_unlock(&db->write_mu);
         return KV_ERR_FAILED;
-    kv_write_lock(db);
-    kv_loc *slot = index_get(&db->idx, key, klen);
-    if (!slot) {
-        kv_unlock(db);
-        return KV_NOT_FOUND;
     }
-    uint32_t old_size = slot->rec_size;
+    /* Only writers add or remove keys, and we are the only writer, so the
+     * answer cannot change before the tombstone is published. */
+    kv_read_lock(db);
+    int exists = index_get(&db->idx, key, klen) != NULL;
+    kv_unlock(db);
     kv_loc loc;
     uint64_t lsn = 0;
     int sync = 0;
-    int rc = append_locked(db, key, (uint32_t)klen, NULL, REC_TOMBSTONE, &loc,
-                           &lsn);
+    int rc = exists ? append(db, key, (uint32_t)klen, NULL, REC_TOMBSTONE, &loc)
+                    : KV_NOT_FOUND;
     if (rc == KV_OK) {
-        index_remove(&db->idx, key, klen, NULL);
-        db->live_bytes -= old_size;
+        kv_write_lock(db);
+        kv_loc old;
+        if (index_remove(&db->idx, key, klen, &old))
+            db->live_bytes -= old.rec_size;
         db->ndeletes++;
+        lsn = publish_locked(db, loc.rec_size);
+        kv_unlock(db);
         sync = needs_sync(db);
     }
-    kv_unlock(db);
+    pthread_mutex_unlock(&db->write_mu);
     return rc == KV_OK && sync ? wait_durable(db, lsn) : rc;
 }
 
-int kv_sync(kv_t *db)
+int kv_sync_all(kv_t *db)
 {
-    if (!db)
-        return KV_ERR_INVALID;
     if (atomic_load(&db->failed))
         return KV_ERR_FAILED;
     kv_read_lock(db);
     uint64_t target = db->written_lsn;
     kv_unlock(db);
     return wait_durable(db, target);
+}
+
+int kv_sync(kv_t *db)
+{
+    if (!db)
+        return KV_ERR_INVALID;
+    return kv_sync_all(db);
 }
 
 /* ---------- reads ---------- */

@@ -2,10 +2,15 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 
 #include "server.h"
 #include "test_util.h"
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 /* ---------- protocol, no sockets ---------- */
 
@@ -225,6 +230,7 @@ static void test_tcp(const char *dir)
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN); /* where MSG_NOSIGNAL is missing */
     static const test_case tests[] = {
         {"protocol", test_protocol},
         {"tcp end-to-end", test_tcp},

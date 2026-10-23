@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cc: gcc }
+          - { os: ubuntu-latest, cc: clang }
+          - { os: macos-latest, cc: clang }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (release, debug)
+        run: |
+          make CC=${{ matrix.cc }}
+          make CC=${{ matrix.cc }} debug
+      - name: Test suite
+        run: make CC=${{ matrix.cc }} test
+      - name: Benchmark smoke run
+        run: make CC=${{ matrix.cc }} bench-quick BENCH_DIR=./bench-data
+
+  sanitizers:
+    name: ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04 runners use 32 bits of mmap ASLR entropy, which the
+      # sanitizers' fixed shadow-memory layout cannot cope with.
+      - name: Lower ASLR entropy for the sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Test suite under ${{ matrix.mode }}
+        run: make test-${{ matrix.mode }}

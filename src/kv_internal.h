@@ -38,6 +38,10 @@ typedef struct {
     unsigned flags;
     uint64_t size;      /* bytes of valid records */
     uint64_t hint_size; /* size of its .hint file, 0 if none */
+    /* For a log segment sealed during this session: the log position of its
+     * end. If that is past durable_lsn, the segment still needs an fsync.
+     * 0 for segments that were already durable (recovered or compacted). */
+    uint64_t end_lsn;
 } segment;
 
 struct kv {
@@ -48,31 +52,51 @@ struct kv {
     kv_options opts;
 
     /*
-     * `lock` guards the index, the segment table and the counters below it.
-     * Readers share it; writers and compaction's short critical sections
-     * take it exclusively. glibc's rwlock prefers readers, so a steady stream
-     * of gets could starve put() forever: a would-be writer therefore holds
-     * `turnstile` while it waits, and readers must pass through it first.
+     * Lock order: compact_mu -> write_mu -> lock -> sync_mu, bg_mu.
+     *
+     * write_mu serializes writers (put, delete, compaction's seal) and is
+     * held across the append syscall. `lock` is taken exclusively only to
+     * publish a finished append, so readers never wait behind a write: on
+     * btrfs a pwrite blocks for the whole of a concurrent fsync of the same
+     * file, and on any Linux filesystem dirty-page throttling can stall it
+     * for many milliseconds.
+     */
+    pthread_mutex_t write_mu;
+    int act_fd;          /* the active segment, as seen by writers */
+    uint64_t act_id;
+    uint64_t act_size;   /* bytes appended and published */
+    uint64_t next_log;   /* number of the next log segment to create */
+    uint32_t unsynced;   /* writes since the last sync (KV_SYNC_EVERY_N) */
+    uint64_t last_ts;
+    uint8_t *wbuf;       /* scratch space for encoding a record */
+    size_t wbuf_cap;
+
+    /*
+     * `lock` guards the index, the segment table and the fields below it.
+     * Readers share it; publishing writers and compaction's short critical
+     * sections take it exclusively. glibc's rwlock prefers readers, so a
+     * steady stream of gets could starve writers forever: a would-be writer
+     * holds `turnstile` while it waits, and readers pass through it first.
+     * Readers only bother when `writers_waiting` says someone is queued, so
+     * the common read path touches no extra shared cache line.
      */
     pthread_rwlock_t lock;
     pthread_mutex_t turnstile;
+    atomic_int writers_waiting;
     kv_index idx;
     segment *segs; /* sorted by id; the last one is the active log segment */
     size_t nsegs, segs_cap;
-    uint64_t next_log;    /* number of the next log segment to create */
-    uint64_t written_lsn; /* bytes appended since open: the log position */
-    uint32_t unsynced;    /* writes since the last sync (KV_SYNC_EVERY_N) */
-    uint64_t last_ts;
+    uint64_t written_lsn; /* bytes published since open: the log position */
+    uint64_t dir_gen;     /* bumped when a log segment file is created */
     uint64_t live_bytes;
     uint64_t nputs, ndeletes, ncompactions;
-    uint8_t *wbuf; /* scratch space for encoding a record */
-    size_t wbuf_cap;
 
     /* Group commit, guarded by sync_mu. Lock order: lock -> sync_mu. */
     pthread_mutex_t sync_mu;
     pthread_cond_t sync_cv;
-    uint64_t durable_lsn; /* every byte below this is on stable storage */
-    int syncing;          /* a leader is inside fsync right now */
+    uint64_t durable_lsn;  /* every byte below this is on stable storage */
+    uint64_t durable_dir;  /* dir_gen as of the last directory fsync */
+    int syncing;           /* a leader is inside fsync right now */
     uint64_t nsyncs;
 
     /* Set after an fsync failure. The kernel may already have dropped the
@@ -95,16 +119,22 @@ struct kv {
 
 static inline void kv_read_lock(kv_t *db)
 {
-    pthread_mutex_lock(&db->turnstile);
-    pthread_mutex_unlock(&db->turnstile);
+    /* A reader that misses a just-arrived writer gets in once more, at most;
+     * every later read sees the flag and queues behind the writer. */
+    if (atomic_load_explicit(&db->writers_waiting, memory_order_relaxed)) {
+        pthread_mutex_lock(&db->turnstile);
+        pthread_mutex_unlock(&db->turnstile);
+    }
     pthread_rwlock_rdlock(&db->lock);
 }
 
 static inline void kv_write_lock(kv_t *db)
 {
+    atomic_fetch_add_explicit(&db->writers_waiting, 1, memory_order_relaxed);
     pthread_mutex_lock(&db->turnstile);
     pthread_rwlock_wrlock(&db->lock);
     pthread_mutex_unlock(&db->turnstile);
+    atomic_fetch_sub_explicit(&db->writers_waiting, 1, memory_order_relaxed);
 }
 
 static inline void kv_unlock(kv_t *db)
@@ -118,10 +148,15 @@ void seg_name(char *buf, size_t n, uint64_t id, const char *ext);
 segment *seg_find(kv_t *db, uint64_t id);
 /* Insert keeping the table sorted. 0, or -1 if out of memory. */
 int seg_insert(kv_t *db, const segment *s);
-/* Create an empty log segment file (and fsync the directory). */
-int seg_create(kv_t *db, uint64_t id, int *fd_out);
-/* Seal the active segment and start log segment next_log. Write lock held. */
+/* Create an empty log segment file. With sync_dir, also make its directory
+ * entry durable right away; otherwise the next group commit does. */
+int seg_create(kv_t *db, uint64_t id, int *fd_out, int sync_dir);
+/* Seal the active segment and start log segment next_log. Requires write_mu;
+ * takes `lock` briefly. Does no fsync: the sealed segment is synced by the
+ * next group commit, so nobody waits behind a flush of a whole segment. */
 int seg_rollover(kv_t *db);
+/* Wait until every byte written so far is durable (group commit). */
+int kv_sync_all(kv_t *db);
 
 static inline segment *seg_active(kv_t *db)
 {
