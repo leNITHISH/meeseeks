@@ -83,7 +83,6 @@ struct kv {
     segment *segs; /* sorted by id; the last one is the active log segment */
     size_t nsegs, segs_cap;
     uint64_t written_lsn; /* bytes published since open: the log position */
-    uint64_t dir_gen;     /* bumped when a log segment file is created */
     uint64_t live_bytes;
     uint64_t nputs, ndeletes, ncompactions;
 
@@ -91,7 +90,6 @@ struct kv {
     pthread_mutex_t sync_mu;
     pthread_cond_t sync_cv;
     uint64_t durable_lsn;  /* every byte below this is on stable storage */
-    uint64_t durable_dir;  /* dir_gen as of the last directory fsync */
     int syncing;           /* a leader is inside fsync right now */
     uint64_t nsyncs;
 
@@ -144,9 +142,8 @@ void seg_name(char *buf, size_t n, uint64_t id, const char *ext);
 segment *seg_find(kv_t *db, uint64_t id);
 /* Insert keeping the table sorted. 0, or -1 if out of memory. */
 int seg_insert(kv_t *db, const segment *s);
-/* Create an empty log segment file. With sync_dir, also make its directory
- * entry durable right away; otherwise the next group commit does. */
-int seg_create(kv_t *db, uint64_t id, int *fd_out, int sync_dir);
+/* Create an empty log segment file and make its directory entry durable. */
+int seg_create(kv_t *db, uint64_t id, int *fd_out);
 /* Seal the active segment (fsync it) and start log segment next_log.
  * Requires write_mu; takes `lock` only briefly, never across the fsync. */
 int seg_rollover(kv_t *db);

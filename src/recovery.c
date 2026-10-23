@@ -439,7 +439,7 @@ int kv_recover(kv_t *db)
         if (db->next_log > SEG_MAX_LOG)
             return KV_ERR_IO;
         segment s = {.id = SEG_ID(db->next_log, 0)};
-        if (seg_create(db, s.id, &s.fd, 1) != 0)
+        if (seg_create(db, s.id, &s.fd) != 0)
             return KV_ERR_IO;
         if (seg_insert(db, &s) != 0) {
             close(s.fd);

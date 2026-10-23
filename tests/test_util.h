@@ -60,7 +60,7 @@ static inline void tu_rmrf(const char *path)
     if (!d)
         return;
     struct dirent *e;
-    char p[512];
+    char p[1024];
     while ((e = readdir(d)) != NULL) {
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;

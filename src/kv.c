@@ -67,7 +67,7 @@ int seg_insert(kv_t *db, const segment *s)
     return 0;
 }
 
-int seg_create(kv_t *db, uint64_t id, int *fd_out, int sync_dir)
+int seg_create(kv_t *db, uint64_t id, int *fd_out)
 {
     char name[SEG_NAME_MAX];
     /* an appendable segment must never be paired with a stale hint */
@@ -78,7 +78,7 @@ int seg_create(kv_t *db, uint64_t id, int *fd_out, int sync_dir)
                     0644);
     if (fd < 0)
         return -1;
-    if (sync_dir && io_fsync_dir(db->dirfd) != 0) {
+    if (io_fsync_dir(db->dirfd) != 0) {
         close(fd);
         unlinkat(db->dirfd, name, 0);
         return -1;
@@ -119,15 +119,17 @@ int seg_rollover(kv_t *db)
     pthread_mutex_unlock(&db->sync_mu);
     db->unsynced = 0;
 
+    /* The new file's directory entry is made durable before any record goes
+     * into it, for the same reason: under POSIX, unsynced directory changes
+     * may persist in any combination, so segment N+2 could otherwise
+     * survive a crash while segment N+1 vanished. */
     segment s = {.id = SEG_ID(db->next_log, 0)};
-    if (seg_create(db, s.id, &s.fd, 0) != 0)
+    if (seg_create(db, s.id, &s.fd) != 0)
         return KV_ERR_IO;
     kv_write_lock(db);
     int rc = seg_insert(db, &s) == 0 ? KV_OK : KV_ERR_NOMEM;
-    if (rc == KV_OK) {
-        db->dir_gen++; /* its directory entry is synced by the next commit */
+    if (rc == KV_OK)
         kv_maybe_kick_compactor(db);
-    }
     kv_unlock(db);
     if (rc != KV_OK) {
         char name[SEG_NAME_MAX];
@@ -518,35 +520,26 @@ static int needs_sync(kv_t *db)
 }
 
 /*
- * The leader's fsync. Sealed segments are durable (rollover syncs them), so
- * every byte up to the current log position is either already durable or in
- * the active segment: sync that, plus the directory if a new segment file
- * appeared since the last time. The fds are dup'ed under the read lock so a
- * concurrent compaction can close the originals without pulling them out
- * from under us.
+ * The leader's fsync. Sealed segments are durable and every segment's
+ * directory entry was synced when it was created, so every byte up to the
+ * current log position is either durable already or in the active segment:
+ * syncing that one file is enough. The fd is dup'ed under the read lock so a
+ * concurrent compaction can close the original without pulling it out from
+ * under us.
  *
- * Returns 1 on success, with the covered log position in *target; 0 if an
+ * Returns 1 on success, with the covered log position in *target; 0 if the
  * fsync failed; -1 if we ran out of descriptors (nothing synced).
  */
-static int leader_sync(kv_t *db, uint64_t synced_dir, uint64_t *target,
-                       uint64_t *dir_gen)
+static int leader_sync(kv_t *db, uint64_t *target)
 {
     kv_read_lock(db);
     *target = db->written_lsn;
-    *dir_gen = db->dir_gen;
     int fd = dup(seg_active(db)->fd);
-    int dirfd = *dir_gen != synced_dir ? dup(db->dirfd) : -1;
-    int rc = fd >= 0 && (*dir_gen == synced_dir || dirfd >= 0) ? 1 : -1;
     kv_unlock(db);
-
-    if (rc == 1 && io_fsync(fd) != 0)
-        rc = 0;
-    if (rc == 1 && dirfd >= 0 && io_fsync_dir(dirfd) != 0)
-        rc = 0;
-    if (fd >= 0)
-        close(fd);
-    if (dirfd >= 0)
-        close(dirfd);
+    if (fd < 0)
+        return -1;
+    int rc = io_fsync(fd) == 0 ? 1 : 0;
+    close(fd);
     return rc;
 }
 
@@ -573,11 +566,10 @@ static int wait_durable(kv_t *db, uint64_t lsn)
             continue;
         }
         db->syncing = 1;
-        uint64_t synced_dir = db->durable_dir;
         pthread_mutex_unlock(&db->sync_mu);
 
-        uint64_t target, dir_gen;
-        int ok = leader_sync(db, synced_dir, &target, &dir_gen);
+        uint64_t target;
+        int ok = leader_sync(db, &target);
 
         pthread_mutex_lock(&db->sync_mu);
         db->syncing = 0;
@@ -585,8 +577,6 @@ static int wait_durable(kv_t *db, uint64_t lsn)
             db->nsyncs++;
             if (target > db->durable_lsn)
                 db->durable_lsn = target;
-            if (dir_gen > db->durable_dir)
-                db->durable_dir = dir_gen;
         }
         pthread_cond_broadcast(&db->sync_cv);
         if (ok == -1) {
