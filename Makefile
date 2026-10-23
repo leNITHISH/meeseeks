@@ -38,7 +38,8 @@ CFLAGS += $(CSTD) $(WARN) $(OPT)
 
 B := build/$(MODE)
 
-LIB_SRC := src/crc32.c src/record.c src/index.c src/kv.c
+LIB_SRC := src/crc32.c src/record.c src/index.c src/io.c src/recovery.c \
+           src/compact.c src/kv.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(B)/obj/%.o)
 LIB     := $(B)/libmeeseeks.a
 

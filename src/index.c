@@ -82,34 +82,37 @@ kv_loc *index_get(kv_index *idx, const void *key, size_t klen)
     return idx->slots[i].key ? &idx->slots[i].loc : NULL;
 }
 
-int index_put(kv_index *idx, const void *key, size_t klen, const kv_loc *loc)
+kv_loc *index_upsert(kv_index *idx, const void *key, size_t klen, int *existed)
 {
     /* keep load factor <= 0.7 */
     if ((idx->count + 1) * 10 > idx->cap * 7 && grow(idx) != 0)
-        return -1;
+        return NULL;
     uint32_t h = index_hash(key, klen);
     size_t i = find_slot(idx, key, klen, h);
     index_slot *s = &idx->slots[i];
+    *existed = s->key != NULL;
     if (!s->key) {
         /* +1 so zero-length keys still get a non-NULL pointer */
         uint8_t *k = malloc(klen + 1);
         if (!k)
-            return -1;
+            return NULL;
         memcpy(k, key, klen);
         s->key = k;
         s->klen = (uint32_t)klen;
         s->hash = h;
+        memset(&s->loc, 0, sizeof s->loc);
         idx->count++;
     }
-    s->loc = *loc;
-    return 0;
+    return &s->loc;
 }
 
-int index_remove(kv_index *idx, const void *key, size_t klen)
+int index_remove(kv_index *idx, const void *key, size_t klen, kv_loc *old)
 {
     size_t i = find_slot(idx, key, klen, index_hash(key, klen));
     if (!idx->slots[i].key)
         return 0;
+    if (old)
+        *old = idx->slots[i].loc;
     free(idx->slots[i].key);
     idx->slots[i].key = NULL;
     idx->count--;

@@ -516,7 +516,7 @@ static void test_compaction_crash_states(const char *dir)
         }
         /* a half-written temp file is always possible too */
         char tmp[512];
-        snprintf(tmp, sizeof tmp, "%s/0000009999.seg.tmp", work);
+        snprintf(tmp, sizeof tmp, "%s/0000009999-000001.seg.tmp", work);
         int fd = open(tmp, O_WRONLY | O_CREAT, 0644);
         CHECK(fd >= 0 && write(fd, "junk", 4) == 4);
         close(fd);
@@ -537,8 +537,10 @@ static void test_garbage_files_ignored(const char *dir)
     kv_t *db = open_db(dir, NULL);
     put_s(db, "a", "1");
     CHECK_RC(kv_close(db), KV_OK);
-    const char *names[] = {"notes.txt", "12.seg", "abcdefghij.seg",
-                           "0000000000.seg"};
+    const char *names[] = {"notes.txt",         "12.seg",
+                           "0000000001.seg",    "abcdefghij-000000.seg",
+                           "0000000000-000000.seg", "0000000001-00000x.seg",
+                           "0000000001-000000.seg.bak"};
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
         char p[512];
         snprintf(p, sizeof p, "%s/%s", dir, names[i]);
