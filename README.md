@@ -24,7 +24,7 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 
 - [Quick start](#quick-start)
 - [How it works](#how-it-works): record format, segments, index, writes and durability, recovery, compaction, backups, concurrency
-- [Testing](#testing) and the bugs it caught
+- [Testing](#testing) and the bugs it found
 - [Benchmarks](#benchmarks)
 - [TCP server](#tcp-server) and [kvtool](#kvtool)
 - [Known limitations](#known-limitations)
@@ -217,9 +217,9 @@ To check that this catches anything, I removed each fsync the store depends on, 
 
 **Testing the tests.** `test_crash` and `test_model` were checked against deliberately broken builds: CRC checks disabled, truncation skipped, tombstones never written, compaction keeping stale versions. The first version of `test_crash` missed the skipped truncation, because new appends happened to overwrite the garbage. It now checks the exact length of every recovered segment.
 
-### Bugs the tests caught
+### Bugs found along the way
 
-Bugs I wrote and the suite found:
+Bugs I wrote, and what found each one:
 
 - **Writer starvation.** glibc's reader-preferring rwlock let readers starve writers; `test_concurrency` hung. Fixed with the turnstile described above.
 - **A data race on the server's stop flag**, found by TSan. `volatile sig_atomic_t` is safe against a signal handler but not across threads; it is now a C11 atomic.
