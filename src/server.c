@@ -3,9 +3,11 @@
 #include "server.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -172,6 +174,20 @@ int server_handle_line(kv_t *db, const char *line, size_t len, sbuf *out)
  * the signal-handler case and is a data race between threads. */
 static atomic_int g_stopping;
 
+/*
+ * Self-pipe: server_serve() polls it next to the listening socket, and
+ * server_stop() writes a byte to it. Shutting the listening socket down
+ * instead only wakes accept() on Linux; on macOS and the BSDs it fails with
+ * ENOTCONN and accept() keeps waiting. write() is async-signal-safe.
+ */
+static int g_wake[2] = {-1, -1};
+
+static int set_flags(int fd, int add, int remove)
+{
+    int fl = fcntl(fd, F_GETFL);
+    return fl < 0 ? -1 : fcntl(fd, F_SETFL, (fl | add) & ~remove);
+}
+
 /* Open client sockets, so shutdown can kick blocked readers. */
 static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_conn_cv = PTHREAD_COND_INITIALIZER;
@@ -308,6 +324,22 @@ int server_listen(const char *host, int port, int *fd_out, int *port_out)
                         ? ntohs(((struct sockaddr_in6 *)&ss)->sin6_port)
                         : ntohs(((struct sockaddr_in *)&ss)->sin_port);
     }
+    if (g_wake[0] < 0) {
+        if (pipe(g_wake) != 0) {
+            close(fd);
+            return -1;
+        }
+        for (int i = 0; i < 2; i++) {
+            set_flags(g_wake[i], O_NONBLOCK, 0);
+            fcntl(g_wake[i], F_SETFD, FD_CLOEXEC);
+        }
+    }
+    char junk[64]; /* forget wake-ups from an earlier server_stop() */
+    while (read(g_wake[0], junk, sizeof junk) > 0)
+        ;
+    /* Non-blocking, so a connection that vanishes between poll() and
+     * accept() cannot leave us stuck in accept(). */
+    set_flags(fd, O_NONBLOCK, 0);
     atomic_store(&g_stopping, 0);
     *fd_out = fd;
     return 0;
@@ -315,19 +347,35 @@ int server_listen(const char *host, int port, int *fd_out, int *port_out)
 
 void server_stop(int listen_fd)
 {
+    (void)listen_fd;
     atomic_store(&g_stopping, 1);
-    shutdown(listen_fd, SHUT_RDWR); /* wakes a blocked accept() */
+    if (g_wake[1] >= 0) {
+        char c = 0;
+        ssize_t unused = write(g_wake[1], &c, 1);
+        (void)unused;
+    }
 }
 
 int server_serve(kv_t *db, int listen_fd)
 {
     int rc = 0;
     while (!atomic_load(&g_stopping)) {
+        struct pollfd pfd[2] = {{.fd = listen_fd, .events = POLLIN},
+                                {.fd = g_wake[0], .events = POLLIN}};
+        if (poll(pfd, 2, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            rc = -1;
+            break;
+        }
+        if (pfd[1].revents || atomic_load(&g_stopping))
+            break;
+        if (!pfd[0].revents)
+            continue;
         int fd = accept(listen_fd, NULL, NULL);
         if (fd < 0) {
-            if (atomic_load(&g_stopping))
-                break;
-            if (errno == EINTR || errno == ECONNABORTED)
+            if (errno == EINTR || errno == ECONNABORTED || errno == EAGAIN ||
+                errno == EWOULDBLOCK)
                 continue;
             if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
                 errno == ENOMEM) {
@@ -338,6 +386,8 @@ int server_serve(kv_t *db, int listen_fd)
             rc = -1;
             break;
         }
+        /* macOS and the BSDs copy O_NONBLOCK from the listening socket */
+        set_flags(fd, 0, O_NONBLOCK);
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 

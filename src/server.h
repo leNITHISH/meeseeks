@@ -40,7 +40,8 @@ int server_listen(const char *host, int port, int *fd_out, int *port_out);
  * caller may close the store afterwards. */
 int server_serve(kv_t *db, int listen_fd);
 
-/* Make server_serve() return. Async-signal-safe. */
+/* Make server_serve() return. Async-signal-safe, and callable from any
+ * thread. */
 void server_stop(int listen_fd);
 
 #endif
