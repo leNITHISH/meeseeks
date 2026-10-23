@@ -92,7 +92,7 @@ The log is split into segment files, 64 MiB by default. Writes go to the active 
 
 Files are named `<log>-<sub>.seg`. Normal log segments have sub 0 (`0000000007-000000.seg`). Compacting everything up to log segment 7 produces `0000000007-000001.seg`, `0000000007-000002.seg` and so on, which sort after all of their inputs and before log segment 8. Recovery replays files in name order, and this naming is what lets new writes continue during compaction: they go to segment 8 and later, so they always win over the compacted copies.
 
-A compacted segment has a hint file next to it with one entry per record: key, offset, record size and a CRC, but no value. Startup reads hints instead of segments, which is 4.6 times faster for 1M keys with 1 KB values.
+A compacted segment has a hint file next to it with one entry per record: key, offset, record size, timestamp and a CRC of the entry, but no value. Startup reads hints instead of segments, which is 4.6 times faster for 1M keys with 1 KB values.
 
 ### Index
 

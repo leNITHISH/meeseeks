@@ -56,10 +56,11 @@ TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
 BENCH   := $(B)/bench
 KVTOOL  := $(B)/kvtool
+LOADGEN := $(B)/loadgen
 
 .PHONY: all debug asan tsan test test-asan test-tsan bench bench-quick fuzz clean
 
-all: $(LIB) $(SERVER) $(KVTOOL) $(TEST_BIN) $(BENCH)
+all: $(LIB) $(SERVER) $(KVTOOL) $(TEST_BIN) $(BENCH) $(LOADGEN)
 
 debug:
 	$(MAKE) MODE=debug all
@@ -95,6 +96,9 @@ $(B)/test_%: tests/test_%.c tests/test_util.h $(LIB)
 
 $(KVTOOL): tools/kvtool.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(LOADGEN): bench/loadgen.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
 
 $(BENCH): bench/bench.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@

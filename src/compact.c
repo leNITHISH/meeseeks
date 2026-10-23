@@ -1,9 +1,9 @@
 /*
  * Compaction that runs alongside reads and writes.
  *
- * 1. Seal (write lock, brief): roll the active log segment L, so new writes go
- *    to L+1. Every segment up to and including L is an input; inputs never
- *    change again.
+ * 1. Seal (writer mutex): fsync and roll the active log segment L, so new
+ *    writes go to L+1. Every segment up to and including L is an input;
+ *    inputs never change again.
  *
  * 2. Copy (mostly unlocked), one ~1 MiB chunk of an input at a time:
  *      a. read the chunk                                         (no lock)
@@ -14,6 +14,7 @@
  *      d. point the index at the copies, but only for keys whose entry
  *         still names the input record; a key written since then
  *         keeps its newer location                               (write lock)
+ *    Steps b and d release the lock every LOCK_BATCH index operations.
  *    Outputs are fsynced, then renamed from .tmp to their final names. They
  *    sort after every input and before L+1, so replaying the directory in id
  *    order gives the right answer even if the process dies right here: the
@@ -27,8 +28,8 @@
  *    close them; no index entry can point at them any more, since every live
  *    one was redirected in 2d. Then unlink the files.
  *
- * Writers wait at most for one chunk's redirect step, readers only for the
- * short write-locked steps. Memory use is bounded by the chunk size.
+ * Readers and writers wait at most for one batch of index operations, plus
+ * writers for the fsync in step 1. Memory use is bounded by the chunk size.
  */
 #include <assert.h>
 #include <fcntl.h>

@@ -22,10 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #ifdef __APPLE__
@@ -234,24 +232,31 @@ static void bench_group_commit(void)
            "at the same time share one fsync.\n\n");
     printf("| writer threads | ops/sec | writes per fsync |\n");
     printf("|---:|---:|---:|\n");
-    uint64_t total = g_quick ? 200 : 4000;
+    uint64_t total = g_quick ? 200 : 2000;
     for (int t = 1; t <= 8; t *= 2) {
-        kv_t *db = fresh(KV_SYNC_ALWAYS, 1);
-        pthread_t th[8];
-        wr_arg args[8];
-        uint64_t t0 = now_ns();
-        for (int i = 0; i < t; i++) {
-            args[i] = (wr_arg){db, (uint64_t)i * total, total / (uint64_t)t};
-            pthread_create(&th[i], NULL, writer_main, &args[i]);
+        double best = 0, per_sync = 0;
+        for (int trial = 0; trial < TRIALS; trial++) {
+            kv_t *db = fresh(KV_SYNC_ALWAYS, 1);
+            pthread_t th[8];
+            wr_arg args[8];
+            uint64_t t0 = now_ns();
+            for (int i = 0; i < t; i++) {
+                args[i] = (wr_arg){db, (uint64_t)i * total, total / (uint64_t)t};
+                pthread_create(&th[i], NULL, writer_main, &args[i]);
+            }
+            for (int i = 0; i < t; i++)
+                pthread_join(th[i], NULL);
+            uint64_t dt = now_ns() - t0;
+            kv_stats st;
+            kv_get_stats(db, &st);
+            kv_close(db);
+            double rate = (double)st.puts * 1e9 / (double)dt;
+            if (rate > best) {
+                best = rate;
+                per_sync = (double)st.puts / (double)(st.syncs ? st.syncs : 1);
+            }
         }
-        for (int i = 0; i < t; i++)
-            pthread_join(th[i], NULL);
-        uint64_t dt = now_ns() - t0;
-        kv_stats st;
-        kv_get_stats(db, &st);
-        kv_close(db);
-        printf("| %d | %.0f | %.2f |\n", t, (double)st.puts * 1e9 / (double)dt,
-               (double)st.puts / (double)(st.syncs ? st.syncs : 1));
+        printf("| %d | %.0f | %.2f |\n", t, best, per_sync);
         fflush(stdout);
     }
     rmrf(g_dir);
@@ -687,44 +692,43 @@ static void bench_mixed(void)
 
 /* ---------- 9. index memory per key ---------- */
 
-static long max_rss_kb(void)
+/* Resident set size right now, where the OS tells us (Linux), else 0. */
+static double rss_mib(void)
 {
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-#ifdef __APPLE__
-    return ru.ru_maxrss / 1024; /* bytes on macOS */
-#else
-    return ru.ru_maxrss; /* KiB on Linux and the BSDs */
-#endif
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f)
+        return 0;
+    long pages = 0, resident = 0;
+    int n = fscanf(f, "%ld %ld", &pages, &resident);
+    fclose(f);
+    return n == 2 ? (double)resident * (double)sysconf(_SC_PAGESIZE) /
+                        (1024.0 * 1024.0)
+                  : 0;
 }
 
 static void bench_memory(void)
 {
     uint64_t nkeys = g_quick ? 10000 : 1000000;
-    printf("\n### Index memory\n\n");
+    printf("\n### Index memory (%lluk keys of %d bytes)\n\n",
+           (unsigned long long)(nkeys / 1000), KEY_LEN);
     kv_t *db = fresh(KV_SYNC_NONE, 1);
     load(db, nkeys, VAL_LEN);
     kv_close(db);
-    /* measure in a fresh process so nothing else inflates the peak RSS */
+    double before = rss_mib();
+    int rc = kv_open(g_dir, NULL, &db);
+    if (rc != KV_OK)
+        die("open", rc);
+    double after = rss_mib();
+    kv_stats st;
+    kv_get_stats(db, &st);
+    printf("The index holds %.1f MiB: %.0f bytes per key.", 
+           mb(st.index_bytes), (double)st.index_bytes / (double)st.keys);
+    if (before > 0)
+        printf(" Opening the store grew the resident set by %.1f MiB.",
+               after - before);
+    printf("\n");
     fflush(stdout);
-    pid_t pid = fork();
-    if (pid == 0) {
-        long before = max_rss_kb();
-        kv_t *d;
-        if (kv_open(g_dir, NULL, &d) != KV_OK)
-            _exit(1);
-        long after = max_rss_kb();
-        printf("Opening a store of %lluk keys (%d B keys) raises peak RSS by "
-               "%.1f MiB: about %.0f bytes per key.\n",
-               (unsigned long long)(nkeys / 1000), KEY_LEN,
-               (double)(after - before) / 1024.0,
-               (double)(after - before) * 1024.0 / (double)nkeys);
-        fflush(stdout);
-        kv_close(d);
-        _exit(0);
-    }
-    int status;
-    waitpid(pid, &status, 0);
+    kv_close(db);
     rmrf(g_dir);
 }
 
