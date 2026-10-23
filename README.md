@@ -142,7 +142,7 @@ A data directory can be open in one handle at a time. A `LOCK` file with an `fcn
 
 Compaction rewrites every sealed segment, keeping only the newest record of each live key and dropping tombstones. Reads and writes continue while it runs:
 
-1. **Seal** (writer mutex, brief): fsync and close the active log segment L and start L+1. Everything up to L is an input and never changes again.
+1. **Seal** (writer mutex): fsync and close the active log segment L and start L+1. Everything up to L is an input and never changes again.
 2. **Copy**, one ~1 MiB chunk of an input at a time. Read the chunk without locks; check which records the index still points at, under the read lock; append those to the current output `L-k` and write its hint entries, without locks; then, under the write lock, point the index at the copies, but only for keys whose entry still names the input record. A key written since keeps its newer location. Lock holds are capped at 512 index operations.
 3. **Commit**: fsync the outputs, rename them from `.tmp` to their final names, fsync the directory, then atomically replace the MANIFEST (write a temp file, fsync, rename, fsync the directory) with "segments before L-1 are obsolete".
 4. **Retire** (write lock, brief): remove the inputs from the segment table, then delete the files.
@@ -205,7 +205,7 @@ Each image is recovered and must equal the state after some prefix of the operat
 
 To check that this catches anything, I removed each fsync the store depends on, one at a time. The checker fails for all eight: the fsync of the active segment on commit, of a segment when it is sealed, of a new segment's directory entry, of a recovery truncation, of compaction output before its rename, of the directory before the MANIFEST commit, of the MANIFEST temp file, and of the directory after the MANIFEST rename.
 
-**Fuzzing.** Three libFuzzer targets run with ASan and UBSan: arbitrary request lines into the protocol handler; arbitrary directory contents into recovery, where any state recovery decides on must survive compaction and reopening unchanged; and random operation sequences, including crashes, against a model.
+**Fuzzing.** Three libFuzzer targets run with ASan and UBSan: arbitrary request lines into the protocol handler; arbitrary directory contents into recovery, where any state recovery decides on must survive compaction and reopening unchanged; and random operation sequences, including crashes, against a model. Five minutes each ran 1.6 million, 105,000 and 26,000 inputs without a failure, and CI fuzzes each target for a minute on every push.
 
 **Testing the tests.** `test_crash` and `test_model` were checked against deliberately broken builds: CRC checks disabled, truncation skipped, tombstones never written, compaction keeping stale versions. The first version of `test_crash` missed the skipped truncation, because new appends happened to overwrite the garbage. It now checks the exact length of every recovered segment.
 
@@ -399,7 +399,7 @@ $ build/release/kvtool check ./data
 - **Values are read whole.** A get allocates and returns the entire value; values are limited to 256 MiB and keys to 64 KiB.
 - **Compaction rewrites everything sealed**, not just the dirtiest segments, and needs free space for a copy of the live data.
 - **Durability is only as good as the drive.** A drive that acknowledges flushes it has not done defeats any fsync policy.
-- **Hint-loaded segments are checksummed lazily.** Damage there shows up as `KV_ERR_CORRUPT` on the affected gets, and compaction refuses to copy it, rather than at startup.
+- **Hint-loaded segments are checksummed lazily.** Damage inside them is not noticed at startup; it shows up as `KV_ERR_CORRUPT` on the affected gets, and compaction stops rather than copy it.
 - **Locking is local.** The `fcntl` lock is advisory and not meant for network filesystems.
 - **The server is minimal**: no authentication or TLS, values cannot contain line breaks, and it runs a thread per connection.
 - **The power-failure checker is Linux-only** and assumes 512-byte sectors are written atomically.
@@ -420,11 +420,12 @@ tools/kvtool.c      offline checker and dump
 tests/              the suites above, plus the LD_PRELOAD recorder
 fuzz/               libFuzzer targets
 bench/bench.c       benchmarks
+bench/loadgen.c     load generator for kvserver
 ```
 
 ## References
 
 - Justin Sheehy and David Smith, [Bitcask: A Log-Structured Hash Table for Fast Key/Value Data](https://riak.com/assets/bitcask-intro.pdf), Basho, 2010.
 - Thanumalayan Sankaranarayana Pillai et al., [All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai), OSDI 2014. The idea behind the power-failure checker.
-- [PostgreSQL's fsync() surprise](https://lwn.net/Articles/752063/), LWN, 2018. Why a failed fsync makes the store read-only.
+- [PostgreSQL's fsync() surprise](https://lwn.net/Articles/752063/), LWN, 2018. Why the store stops accepting writes after a failed fsync.
 - Jean-Philippe Aumasson and Daniel J. Bernstein, [SipHash: a fast short-input PRF](https://www.aumasson.jp/siphash/siphash.pdf), 2012.
