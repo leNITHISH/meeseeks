@@ -80,7 +80,7 @@ static void model_load(model *m, const char *dir)
     while ((e = readdir(d)) != NULL)
         if (tu_has_suffix(e->d_name, ".seg")) {
             CHECK(m->nsegs < 256);
-            snprintf(m->segs[m->nsegs++].name, 32, "%s", e->d_name);
+            snprintf(m->segs[m->nsegs++].name, 32, "%.31s", e->d_name);
         }
     closedir(d);
     /* zero-padded ids: lexical order is id order, which is replay order */

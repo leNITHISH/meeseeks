@@ -135,8 +135,8 @@ int main(int argc, char **argv)
             if (nsegs == cap)
                 segs = realloc(segs, (cap = cap ? cap * 2 : 16) * sizeof *segs);
             segs[nsegs].id = id;
-            snprintf(segs[nsegs].name, sizeof segs[nsegs].name, "%s",
-                     e->d_name);
+            snprintf(segs[nsegs].name, sizeof segs[nsegs].name, "%.63s",
+                     e->d_name); /* a validated 21-character name */
             nsegs++;
         }
     }
