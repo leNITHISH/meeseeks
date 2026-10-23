@@ -285,6 +285,51 @@ static void test_connection_limit(const char *dir)
     server_set_max_conns(SERVER_DEFAULT_MAX_CONNS);
 }
 
+/* Pipelined GETs of a large value: replies are sent as they are produced
+ * rather than collected for the whole batch, and must arrive intact. */
+static void test_large_pipelined_replies(const char *dir)
+{
+    server_ctx s;
+    int port;
+    CHECK_RC(kv_open(dir, NULL, &s.db), KV_OK);
+    size_t big = 600 * 1024;
+    char *val = malloc(big);
+    for (size_t i = 0; i < big; i++)
+        val[i] = (char)('a' + i % 26);
+    CHECK_RC(kv_put(s.db, "big", 3, val, big), KV_OK);
+    CHECK(server_listen("127.0.0.1", 0, &s.listen_fd, &port) == 0);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, server_thread, &s) == 0);
+
+    client c;
+    client_connect(&c, port);
+    enum { N = 40 }; /* 24 MB of replies to 320 bytes of requests */
+    char req[N * 8];
+    for (int i = 0; i < N; i++)
+        memcpy(req + i * 8, "GET big\n", 8);
+    client_send(&c, req, sizeof req);
+    /* read the replies byte by byte through a big buffer */
+    size_t want = N * (6 + big + 1), got = 0;
+    char *in = malloc(want);
+    while (got < want) {
+        ssize_t r = recv(c.fd, in + got, want - got, 0);
+        CHECK(r > 0);
+        got += (size_t)r;
+    }
+    for (int i = 0; i < N; i++) {
+        const char *rep = in + (size_t)i * (6 + big + 1);
+        CHECK(memcmp(rep, "VALUE ", 6) == 0 && memcmp(rep + 6, val, big) == 0 &&
+              rep[6 + big] == '\n');
+    }
+    close(c.fd);
+    server_stop(s.listen_fd);
+    pthread_join(th, NULL);
+    close(s.listen_fd);
+    CHECK_RC(kv_close(s.db), KV_OK);
+    free(in);
+    free(val);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN); /* where MSG_NOSIGNAL is missing */
@@ -292,6 +337,7 @@ int main(void)
         {"protocol", test_protocol},
         {"tcp end-to-end", test_tcp},
         {"connection limit", test_connection_limit},
+        {"large pipelined replies", test_large_pipelined_replies},
     };
     return tu_run("test_server", tests, sizeof tests / sizeof *tests);
 }

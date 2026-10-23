@@ -280,6 +280,15 @@ static void *conn_main(void *arg)
                 goto done;
             }
             start += llen + 1;
+            /* Send as we go: a single read can hold thousands of pipelined
+             * GETs of a large value, and their replies must not pile up in
+             * memory. A client that does not read then stalls on TCP
+             * backpressure instead. */
+            if (out.len >= SERVER_FLUSH_BYTES) {
+                if (send_all(c.fd, out.data, out.len) != 0)
+                    goto done;
+                out.len = 0;
+            }
         }
         memmove(buf, buf + start, len - start);
         len -= start;

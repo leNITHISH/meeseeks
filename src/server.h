@@ -23,6 +23,7 @@
 
 #define SERVER_MAX_LINE (1u << 20)
 #define SERVER_DEFAULT_MAX_CONNS 1024
+#define SERVER_FLUSH_BYTES (1u << 20) /* most reply bytes held per client */
 
 typedef struct {
     char *data;
