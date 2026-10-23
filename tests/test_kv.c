@@ -780,6 +780,115 @@ static void test_bad_options(const char *dir)
     CHECK_RC(kv_open(dir, &o, &db), KV_ERR_INVALID);
 }
 
+/* ---------- edges found by coverage ---------- */
+
+static void test_open_creates_directory(const char *dir)
+{
+    char sub[512], nested[600];
+    snprintf(sub, sizeof sub, "%s/store", dir);
+    snprintf(nested, sizeof nested, "%s/missing/store", dir);
+    kv_t *db;
+    CHECK_RC(kv_open(nested, NULL, &db), KV_ERR_IO); /* not recursive */
+    CHECK_RC(kv_open(sub, NULL, &db), KV_OK);
+    put_s(db, "k", "v");
+    CHECK_RC(kv_close(db), KV_OK);
+    CHECK_RC(kv_open(sub, NULL, &db), KV_OK);
+    expect(db, "k", "v");
+    CHECK_RC(kv_close(db), KV_OK);
+    tu_rmrf(sub);
+}
+
+/* A record bigger than compaction's 1 MiB read chunk takes its own path. */
+static void test_compact_huge_record(const char *dir)
+{
+    kv_options o = small_opts(1 << 20);
+    kv_t *db = open_db(dir, &o);
+    size_t big = 3u << 20;
+    char *huge = malloc(big + 1);
+    CHECK(huge);
+    for (size_t i = 0; i < big; i++)
+        huge[i] = (char)('a' + i % 23);
+    huge[big] = '\0';
+    fill_overwrites(db, 100, 3);
+    put_s(db, "huge", huge);
+    fill_overwrites(db, 100, 3); /* garbage after it too */
+    CHECK_RC(kv_compact(db), KV_OK);
+    expect(db, "huge", huge);
+    check_final_round(db, 100, 3, 0);
+    CHECK_RC(kv_close(db), KV_OK);
+    for (int hints = 1; hints >= 0; hints--) {
+        o.use_hints = hints;
+        db = open_db(dir, &o);
+        expect(db, "huge", huge);
+        check_final_round(db, 100, 3, 0);
+        CHECK_RC(kv_close(db), KV_OK);
+    }
+    free(huge);
+}
+
+/*
+ * Segments loaded from hint files are not checksummed at startup, so damage
+ * there first shows up later. Gets must report it rather than return it,
+ * and compaction must refuse to copy it, leaving the store usable.
+ */
+static void test_compaction_refuses_corruption(const char *dir)
+{
+    kv_options o = small_opts(1 << 20);
+    build_compacted(dir, &o);
+    char seg[64], p[512];
+    first_file(dir, ".seg", seg);
+    snprintf(p, sizeof p, "%s/%s", dir, seg);
+    off_t size = tu_file_size(p);
+    int fd = open(p, O_RDWR);
+    uint8_t b;
+    CHECK(fd >= 0 && pread(fd, &b, 1, size - 3) == 1);
+    b ^= 0x40;
+    CHECK(pwrite(fd, &b, 1, size - 3) == 1);
+    close(fd);
+
+    kv_t *db = open_db(dir, &o); /* via the hint: damage not seen yet */
+    CHECK(kv_count(db) == 500);
+    CHECK_RC(kv_compact(db), KV_ERR_CORRUPT);
+    int corrupt = 0;
+    for (int i = 0; i < 500; i++) {
+        char k[32];
+        void *v;
+        size_t n;
+        snprintf(k, sizeof k, "key-%05d", i);
+        int rc = kv_get(db, k, strlen(k), &v, &n);
+        if (rc == KV_OK)
+            free(v);
+        else
+            CHECK_RC(rc, KV_ERR_CORRUPT);
+        corrupt += rc != KV_OK;
+    }
+    CHECK(corrupt == 1);
+    put_s(db, "after", "still writable");
+    expect(db, "after", "still writable");
+    CHECK_RC(kv_close(db), KV_OK);
+    o.use_hints = 0; /* a replay truncates the damaged record away */
+    db = open_db(dir, &o);
+    expect(db, "after", "still writable");
+    CHECK(kv_count(db) == 500);
+    CHECK_RC(kv_compact(db), KV_OK);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
+static void test_strerror(const char *dir)
+{
+    (void)dir;
+    int codes[] = {KV_OK,          KV_NOT_FOUND,   KV_ERR_IO,
+                   KV_ERR_NOMEM,   KV_ERR_INVALID, KV_ERR_CORRUPT,
+                   KV_ERR_LOCKED,  KV_ERR_FAILED};
+    size_t n = sizeof codes / sizeof *codes;
+    for (size_t i = 0; i < n; i++) {
+        CHECK(strcmp(kv_strerror(codes[i]), "unknown error") != 0);
+        for (size_t j = 0; j < i; j++)
+            CHECK(strcmp(kv_strerror(codes[i]), kv_strerror(codes[j])) != 0);
+    }
+    CHECK(strcmp(kv_strerror(-99), "unknown error") == 0);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -808,6 +917,10 @@ int main(void)
         {"stats", test_stats},
         {"background compaction", test_auto_compaction},
         {"bad options", test_bad_options},
+        {"open creates its directory", test_open_creates_directory},
+        {"compaction of a record over 1 MiB", test_compact_huge_record},
+        {"compaction refuses corrupt records", test_compaction_refuses_corruption},
+        {"error strings", test_strerror},
     };
     return tu_run("test_kv", tests, sizeof tests / sizeof *tests);
 }

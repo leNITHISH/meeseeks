@@ -184,8 +184,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (off + rsz > seg[1].len)
             break;
         uint8_t h[HINT_HDR_SIZE + 32];
-        hint_encode(h, get_u64(seg[1].b + off + 4), seg[1].b + off + REC_HDR_SIZE,
-                    ksz, off, (uint32_t)rsz);
+        hint_encode_header(h, get_u64(seg[1].b + off + 4),
+                           seg[1].b + off + REC_HDR_SIZE, ksz, off,
+                           (uint32_t)rsz);
+        memcpy(h + HINT_HDR_SIZE, seg[1].b + off + REC_HDR_SIZE, ksz);
         put_bytes(&hint, h, HINT_HDR_SIZE + ksz);
         off += rsz;
     }

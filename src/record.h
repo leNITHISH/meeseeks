@@ -67,9 +67,11 @@ void record_encode(uint8_t *buf, uint64_t ts, const void *key, uint32_t ksz,
 /* Verify the crc of a full serialized record of length len. */
 int record_crc_ok(const uint8_t *buf, uint64_t len);
 
-/* Serialize a hint entry into buf (HINT_HDR_SIZE + ksz bytes). */
-void hint_encode(uint8_t *buf, uint64_t ts, const void *key, uint32_t ksz,
-                 uint64_t offset, uint32_t rec_size);
+/* Fill in the HINT_HDR_SIZE-byte header of a hint entry. The key itself
+ * follows the header in the file; it is passed separately because the
+ * checksum covers it too, so callers need not copy it next to the header. */
+void hint_encode_header(uint8_t *hdr, uint64_t ts, const void *key,
+                        uint32_t ksz, uint64_t offset, uint32_t rec_size);
 
 int hint_crc_ok(const uint8_t *buf, uint64_t len);
 

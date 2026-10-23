@@ -70,7 +70,8 @@ static int run_child(void (*fn)(const char *, int *), const char *dir,
         close(fds[0]);
         fn(dir, last);
         ssize_t want = (ssize_t)(NKEYS * sizeof *last);
-        _exit(write(fds[1], last, (size_t)want) == want ? 0 : 9);
+        /* exit, not _exit: a coverage build records the child's lines */
+        exit(write(fds[1], last, (size_t)want) == want ? 0 : 9);
     }
     close(fds[1]);
     ssize_t got = read(fds[0], last, NKEYS * sizeof *last);

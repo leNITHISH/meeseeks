@@ -38,7 +38,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "crc32.h"
 #include "io.h"
 #include "kv_internal.h"
 #include "record.h"
@@ -175,9 +174,14 @@ static int out_finish(compactor *c)
 {
     kv_t *db = c->db;
     int rc = out_flush(c);
-    if (rc == KV_OK && (io_writer_flush(&c->hint) != 0 || io_fsync(c->fd) != 0 ||
-                        io_fsync(c->hint_fd) != 0))
+    if (rc == KV_OK && io_writer_flush(&c->hint) != 0)
         rc = KV_ERR_IO;
+    if (rc == KV_OK && (io_fsync(c->fd) != 0 || io_fsync(c->hint_fd) != 0)) {
+        /* Records already redirected to this output may be among the
+         * pages the kernel gave up on; stop trusting the store. */
+        kv_set_failed(db);
+        rc = KV_ERR_FAILED;
+    }
     uint64_t hint_size = io_writer_size(&c->hint);
     close(c->hint_fd);
     io_writer_free(&c->hint);
@@ -274,12 +278,8 @@ static int out_add(compactor *c, const uint8_t *rec, const chunk_rec *r,
     c->olen += r->rsz;
 
     uint8_t h[HINT_HDR_SIZE];
-    put_u64(h + 4, get_u64(rec + 4));
-    put_u32(h + 12, r->ksz);
-    put_u64(h + 16, new_off);
-    put_u32(h + 24, r->rsz);
-    uint32_t crc = crc32_update(0, h + 4, HINT_HDR_SIZE - 4);
-    put_u32(h, crc32_update(crc, rec + REC_HDR_SIZE, r->ksz));
+    hint_encode_header(h, get_u64(rec + 4), rec + REC_HDR_SIZE, r->ksz,
+                       new_off, r->rsz);
     if (io_writer_put(&c->hint, h, sizeof h) != 0 ||
         io_writer_put(&c->hint, rec + REC_HDR_SIZE, r->ksz) != 0)
         return KV_ERR_IO;
@@ -495,11 +495,14 @@ int kv_compact(kv_t *db)
     if (rc != KV_OK)
         out_abandon(&c);
 
-    /* 3. Commit. */
-    if (rc == KV_OK && io_fsync_dir(db->dirfd) != 0)
-        rc = KV_ERR_IO;
-    if (rc == KV_OK && manifest_write(db, SEG_ID(c.log, 1)) != 0)
-        rc = KV_ERR_IO;
+    /* 3. Commit. If a sync fails here, whether the outputs or the new
+     * MANIFEST will survive a crash is unknown: stop accepting writes, and
+     * let the next open sort it out from whatever is on disk. */
+    if (rc == KV_OK && (io_fsync_dir(db->dirfd) != 0 ||
+                        manifest_write(db, SEG_ID(c.log, 1)) != 0)) {
+        kv_set_failed(db);
+        rc = KV_ERR_FAILED;
+    }
 
     /* 4. Retire the inputs. */
     assert(rc != KV_OK || inputs_unreferenced(db, inputs, nin));

@@ -142,7 +142,8 @@ void seg_name(char *buf, size_t n, uint64_t id, const char *ext);
 segment *seg_find(kv_t *db, uint64_t id);
 /* Insert keeping the table sorted. 0, or -1 if out of memory. */
 int seg_insert(kv_t *db, const segment *s);
-/* Create an empty log segment file and make its directory entry durable. */
+/* Create an empty log segment file and make its directory entry durable.
+ * KV_OK, KV_ERR_IO, or KV_ERR_FAILED if the directory fsync failed. */
 int seg_create(kv_t *db, uint64_t id, int *fd_out);
 /* Seal the active segment (fsync it) and start log segment next_log.
  * Requires write_mu; takes `lock` only briefly, never across the fsync. */
@@ -163,7 +164,9 @@ static inline uint64_t kv_disk_bytes_locked(kv_t *db)
     return n;
 }
 
-/* Mark the store failed after an fsync error (see `failed`). */
+/* Mark the store failed after an fsync error (see `failed`). Any failed
+ * fsync counts, of file data or of a directory: afterwards nothing the
+ * store wrote since the last good sync can be trusted to reach the disk. */
 void kv_set_failed(kv_t *db);
 
 /* Wake the background compactor if garbage passed the threshold. */

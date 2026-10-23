@@ -54,7 +54,7 @@ LIB     := $(B)/libmeeseeks.a
 
 TESTS   := test_kv test_model test_crash test_kill test_faults test_concurrency test_server
 ifeq ($(shell uname -s),Linux)
-  TESTS += test_powerfail  # needs LD_PRELOAD interposition
+  TESTS += test_powerfail test_fsyncfail  # need LD_PRELOAD interposition
 endif
 TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
@@ -94,6 +94,12 @@ $(B)/pf_shim.so: tests/pf_shim.c | $(B)/obj
 
 $(B)/test_powerfail: tests/test_powerfail.c tests/test_util.h $(LIB) $(B)/pf_shim.so
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -ldl -o $@
+
+$(B)/fault_shim.so: tests/fault_shim.c | $(B)/obj
+	$(CC) -std=c11 -O2 -fPIC -shared -Wall -Wextra $< -o $@ -ldl
+
+$(B)/test_fsyncfail: tests/test_fsyncfail.c tests/test_util.h $(LIB) $(B)/fault_shim.so
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
 $(B)/test_%: tests/test_%.c tests/test_util.h $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@

@@ -77,14 +77,15 @@ int seg_create(kv_t *db, uint64_t id, int *fd_out)
     int fd = openat(db->dirfd, name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
                     0644);
     if (fd < 0)
-        return -1;
+        return KV_ERR_IO;
     if (io_fsync_dir(db->dirfd) != 0) {
         close(fd);
         unlinkat(db->dirfd, name, 0);
-        return -1;
+        kv_set_failed(db);
+        return KV_ERR_FAILED;
     }
     *fd_out = fd;
-    return 0;
+    return KV_OK;
 }
 
 void kv_set_failed(kv_t *db)
@@ -124,10 +125,11 @@ int seg_rollover(kv_t *db)
      * may persist in any combination, so segment N+2 could otherwise
      * survive a crash while segment N+1 vanished. */
     segment s = {.id = SEG_ID(db->next_log, 0)};
-    if (seg_create(db, s.id, &s.fd) != 0)
-        return KV_ERR_IO;
+    int rc = seg_create(db, s.id, &s.fd);
+    if (rc != KV_OK)
+        return rc;
     kv_write_lock(db);
-    int rc = seg_insert(db, &s) == 0 ? KV_OK : KV_ERR_NOMEM;
+    rc = seg_insert(db, &s) == 0 ? KV_OK : KV_ERR_NOMEM;
     if (rc == KV_OK)
         kv_maybe_kick_compactor(db);
     kv_unlock(db);

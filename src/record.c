@@ -23,15 +23,15 @@ int record_crc_ok(const uint8_t *buf, uint64_t len)
            get_u32(buf) == crc32_update(0, buf + 4, (size_t)(len - 4));
 }
 
-void hint_encode(uint8_t *buf, uint64_t ts, const void *key, uint32_t ksz,
-                 uint64_t offset, uint32_t rec_size)
+void hint_encode_header(uint8_t *hdr, uint64_t ts, const void *key,
+                        uint32_t ksz, uint64_t offset, uint32_t rec_size)
 {
-    put_u64(buf + 4, ts);
-    put_u32(buf + 12, ksz);
-    put_u64(buf + 16, offset);
-    put_u32(buf + 24, rec_size);
-    memcpy(buf + HINT_HDR_SIZE, key, ksz);
-    put_u32(buf, crc32_update(0, buf + 4, HINT_HDR_SIZE - 4 + ksz));
+    put_u64(hdr + 4, ts);
+    put_u32(hdr + 12, ksz);
+    put_u64(hdr + 16, offset);
+    put_u32(hdr + 24, rec_size);
+    uint32_t crc = crc32_update(0, hdr + 4, HINT_HDR_SIZE - 4);
+    put_u32(hdr, crc32_update(crc, key, ksz));
 }
 
 int hint_crc_ok(const uint8_t *buf, uint64_t len)
