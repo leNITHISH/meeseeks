@@ -200,6 +200,14 @@ static pthread_mutex_t g_conn_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_conn_cv = PTHREAD_COND_INITIALIZER;
 static int *g_conns;
 static size_t g_nconns, g_conns_cap;
+static size_t g_max_conns = SERVER_DEFAULT_MAX_CONNS;
+
+void server_set_max_conns(size_t n)
+{
+    pthread_mutex_lock(&g_conn_mu);
+    g_max_conns = n ? n : 1;
+    pthread_mutex_unlock(&g_conn_mu);
+}
 
 typedef struct {
     kv_t *db;
@@ -401,6 +409,9 @@ int server_serve(kv_t *db, int listen_fd)
         conn *c = malloc(sizeof *c);
         pthread_mutex_lock(&g_conn_mu);
         int ok = c != NULL;
+        int full = g_nconns >= g_max_conns; /* one thread per client: cap it */
+        if (full)
+            ok = 0;
         if (ok && g_nconns == g_conns_cap) {
             size_t cap = g_conns_cap ? g_conns_cap * 2 : 16;
             int *t = realloc(g_conns, cap * sizeof *t);
@@ -427,6 +438,9 @@ int server_serve(kv_t *db, int listen_fd)
         pthread_attr_destroy(&attr);
         pthread_mutex_unlock(&g_conn_mu);
         if (!ok) {
+            static const char busy[] = "ERR too many connections\n";
+            if (full) /* best effort: the socket is fresh, this fits */
+                send_all(fd, busy, sizeof busy - 1);
             free(c);
             close(fd);
         }
@@ -462,15 +476,16 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s [-d dir] [-H host] [-p port] [-s always|batch|none] "
-            "[-n N] [-c ratio]\n"
+            "[-n N] [-c ratio] [-m N]\n"
             "  -d  data directory (default ./data)\n"
             "  -H  listen address (default 127.0.0.1)\n"
             "  -p  port (default 7379)\n"
             "  -s  fsync policy (default batch)\n"
             "  -n  writes per fsync for -s batch (default 100)\n"
             "  -c  compact in the background once this fraction of the log\n"
-            "      is garbage (default 0.5; 0 turns it off)\n",
-            prog);
+            "      is garbage (default 0.5; 0 turns it off)\n"
+            "  -m  most clients served at once (default %d)\n",
+            prog, SERVER_DEFAULT_MAX_CONNS);
 }
 
 int main(int argc, char **argv)
@@ -480,7 +495,7 @@ int main(int argc, char **argv)
     kv_options o;
     kv_default_options(&o);
     o.auto_compact_ratio = 0.5; /* a long-running server must reclaim space */
-    while ((opt = getopt(argc, argv, "d:H:p:s:n:c:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:H:p:s:n:c:m:h")) != -1) {
         switch (opt) {
         case 'd':
             dir = optarg;
@@ -508,6 +523,9 @@ int main(int argc, char **argv)
             break;
         case 'c':
             o.auto_compact_ratio = strtod(optarg, NULL);
+            break;
+        case 'm':
+            server_set_max_conns((size_t)strtoul(optarg, NULL, 10));
             break;
         default:
             usage(argv[0]);

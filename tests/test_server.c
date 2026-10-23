@@ -238,12 +238,60 @@ static void test_tcp(const char *dir)
     CHECK_RC(kv_close(s.db), KV_OK);
 }
 
+static void test_connection_limit(const char *dir)
+{
+    server_ctx s;
+    int port;
+    server_set_max_conns(2);
+    CHECK_RC(kv_open(dir, NULL, &s.db), KV_OK);
+    CHECK(server_listen("127.0.0.1", 0, &s.listen_fd, &port) == 0);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, server_thread, &s) == 0);
+
+    client a, b, c;
+    client_connect(&a, port);
+    client_send(&a, "GET x\n", 6);
+    expect_line(&a, "NOT_FOUND"); /* served: it holds a slot */
+    client_connect(&b, port);
+    client_send(&b, "GET x\n", 6);
+    expect_line(&b, "NOT_FOUND");
+    client_connect(&c, port); /* the third is turned away */
+    expect_line(&c, "ERR too many connections");
+    char buf[16];
+    CHECK(recv(c.fd, buf, sizeof buf, 0) == 0); /* and closed */
+    close(c.fd);
+
+    close(a.fd); /* a slot frees up once a's thread has gone */
+    int served = 0;
+    for (int tries = 0; tries < 200 && !served; tries++) {
+        client d;
+        client_connect(&d, port);
+        client_send(&d, "SET k v\n", 8);
+        char line[64];
+        client_line(&d, line, sizeof line);
+        served = strcmp(line, "OK") == 0;
+        if (!served)
+            CHECK(strcmp(line, "ERR too many connections") == 0);
+        close(d.fd);
+        if (!served)
+            tu_sleep_us(5000);
+    }
+    CHECK(served);
+    close(b.fd);
+    server_stop(s.listen_fd);
+    pthread_join(th, NULL);
+    close(s.listen_fd);
+    CHECK_RC(kv_close(s.db), KV_OK);
+    server_set_max_conns(SERVER_DEFAULT_MAX_CONNS);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN); /* where MSG_NOSIGNAL is missing */
     static const test_case tests[] = {
         {"protocol", test_protocol},
         {"tcp end-to-end", test_tcp},
+        {"connection limit", test_connection_limit},
     };
     return tu_run("test_server", tests, sizeof tests / sizeof *tests);
 }

@@ -196,7 +196,7 @@ Two problems shaped this design, both found by tests:
 | `test_powerfail` | Power-failure simulation, described below. About 15,600 crash images per run. |
 | `test_fsyncfail` | fsync starts failing with EIO after N calls (an `LD_PRELOAD` shim), for every N from 0 to 80: while opening, on group commits, at segment rollover and inside compaction, with one and four writers. The store must refuse further writes, keep serving reads, release every waiting writer, and lose no acknowledged write once reopened. |
 | `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause; backups taken mid-write and mid-compaction |
-| `test_server` | The protocol, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 8 concurrent clients, shutdown with clients connected |
+| `test_server` | The protocol, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 8 concurrent clients, the connection limit, shutdown with clients connected |
 
 **Power-failure checker.** A SIGKILL test keeps the page cache, so it cannot tell whether the right fsyncs happen. `tests/pf_shim.c` is loaded with `LD_PRELOAD` and records every create, write, truncate, fsync, rename and unlink the unmodified library makes in the store directory. `test_powerfail` replays that log through a model of a POSIX filesystem and, at every point in it, builds four images of what the disk could hold after a power cut:
 
@@ -356,7 +356,7 @@ GET
 ERR wrong number of arguments for 'GET'
 ```
 
-The value is everything after the single space that follows the key, so it can contain spaces. Keys and values cannot contain a carriage return, which would be indistinguishable from a CRLF line ending. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection. Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address, and `-c` the fraction of garbage that triggers background compaction (default 0.5, `-c 0` turns it off). SIGINT or SIGTERM closes the store cleanly. In a 6-second soak of 2 KB overwrites, the server took 627,000 puts (about 1.3 GB), compacted 9 times along the way, and ended with 59 MB on disk.
+The value is everything after the single space that follows the key, so it can contain spaces. Keys and values cannot contain a carriage return, which would be indistinguishable from a CRLF line ending. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection. Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address, `-c` the fraction of garbage that triggers background compaction (default 0.5, `-c 0` turns it off), and `-m` the most clients served at once (default 1024; each gets a thread, and connections beyond that are answered `ERR too many connections` and closed). SIGINT or SIGTERM closes the store cleanly. In a 6-second soak of 2 KB overwrites, the server took 627,000 puts (about 1.3 GB), compacted 9 times along the way, and ended with 59 MB on disk.
 
 Throughput, measured with [`bench/loadgen.c`](bench/loadgen.c) on the laptop described under [Benchmarks](#benchmarks). Client and server share its four hardware threads, the store uses the default fsync policy (every 100 writes), values are 100 bytes, and each row is the best of three 4-second runs:
 
@@ -412,7 +412,7 @@ $ build/release/kvtool check ./data
 - **Durability is only as good as the drive.** A drive that acknowledges flushes it has not done defeats any fsync policy.
 - **Hint-loaded segments are checksummed lazily.** Damage inside them is not noticed at startup; it shows up as `KV_ERR_CORRUPT` on the affected gets, and compaction stops rather than copy it.
 - **Locking is local.** The `fcntl` lock is advisory and not meant for network filesystems.
-- **The server is minimal**: no authentication or TLS, keys and values cannot contain line breaks, and it runs a thread per connection.
+- **The server is minimal**: no authentication or TLS, keys and values cannot contain line breaks, and it runs a thread per connection, so the number of clients is capped (`-m`, 1024 by default).
 - **The power-failure checker is Linux-only** and assumes 512-byte sectors are written atomically.
 
 ## Layout
