@@ -43,7 +43,7 @@ LIB_SRC := src/crc32.c src/record.c src/index.c src/io.c src/recovery.c \
 LIB_OBJ := $(LIB_SRC:src/%.c=$(B)/obj/%.o)
 LIB     := $(B)/libmeeseeks.a
 
-TESTS   := test_kv test_model test_crash test_concurrency test_server
+TESTS   := test_kv test_model test_crash test_kill test_faults test_concurrency test_server
 TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
 BENCH   := $(B)/bench
@@ -89,11 +89,13 @@ test: $(TEST_BIN)
 test-asan:
 	$(MAKE) MODE=asan test
 
-# TSan only matters where threads share a store.
+# TSan only matters where threads share a store (incl. background compaction).
+TSAN_TESTS := test_concurrency test_server test_kv test_kill
 test-tsan:
-	$(MAKE) MODE=tsan build/tsan/test_concurrency build/tsan/test_server
-	TSAN_OPTIONS=halt_on_error=1 build/tsan/test_concurrency
-	TSAN_OPTIONS=halt_on_error=1 build/tsan/test_server
+	$(MAKE) MODE=tsan $(TSAN_TESTS:%=build/tsan/%)
+	@set -e; for t in $(TSAN_TESTS); do echo "== build/tsan/$$t"; \
+	  TSAN_OPTIONS=halt_on_error=1 KILL_ROUNDS=30 build/tsan/$$t; done
+	@echo "all tests passed (tsan)"
 
 bench: $(BENCH)
 	$(BENCH)

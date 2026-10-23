@@ -1,4 +1,6 @@
 /* Functional tests for the public API. */
+#include <sys/wait.h>
+
 #include "test_util.h"
 
 static kv_options small_opts(uint64_t segment_size)
@@ -577,6 +579,127 @@ static void test_sync_policies(const char *dir)
     (void)dir;
 }
 
+
+/* ---------- locking, stats, background compaction ---------- */
+
+static void test_lock_same_process(const char *dir)
+{
+    kv_t *a, *b;
+    CHECK_RC(kv_open(dir, NULL, &a), KV_OK);
+    CHECK_RC(kv_open(dir, NULL, &b), KV_ERR_LOCKED);
+    char alias[512]; /* same directory through another path */
+    snprintf(alias, sizeof alias, "%s/.", dir);
+    CHECK_RC(kv_open(alias, NULL, &b), KV_ERR_LOCKED);
+    put_s(a, "k", "v");
+    CHECK_RC(kv_close(a), KV_OK);
+    CHECK_RC(kv_open(alias, NULL, &b), KV_OK);
+    expect(b, "k", "v");
+    CHECK_RC(kv_close(b), KV_OK);
+}
+
+static int open_in_child(const char *dir)
+{
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        kv_t *db;
+        int rc = kv_open(dir, NULL, &db);
+        if (rc == KV_OK)
+            kv_close(db);
+        _exit(rc == KV_OK ? 0 : rc == KV_ERR_LOCKED ? 1 : 2);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+    return WEXITSTATUS(status);
+}
+
+static void test_lock_other_process(const char *dir)
+{
+    kv_t *db;
+    CHECK_RC(kv_open(dir, NULL, &db), KV_OK);
+    CHECK(open_in_child(dir) == 1); /* locked while we hold it */
+    CHECK_RC(kv_close(db), KV_OK);
+    CHECK(open_in_child(dir) == 0); /* free once closed */
+}
+
+static void test_stats(const char *dir)
+{
+    kv_options o = small_opts(1 << 20);
+    kv_t *db = open_db(dir, &o);
+    put_s(db, "a", "1234");     /* 20 + 1 + 4 = 25 bytes */
+    put_s(db, "bb", "123456");  /* 28 */
+    put_s(db, "a", "12345678"); /* 29, replaces the 25 */
+    put_s(db, "ccc", "x");      /* 24 */
+    CHECK_RC(kv_delete(db, "ccc", 3), KV_OK); /* tombstone: 23 */
+    kv_stats st;
+    kv_get_stats(db, &st);
+    CHECK(st.keys == 2);
+    CHECK(st.live_bytes == 29 + 28);
+    CHECK(st.dead_bytes == 25 + 24 + 23);
+    CHECK(st.puts == 4 && st.deletes == 1 && st.compactions == 0);
+    CHECK(st.disk_bytes == 29 + 28 + 25 + 24 + 23);
+
+    CHECK_RC(kv_compact(db), KV_OK);
+    kv_get_stats(db, &st);
+    CHECK(st.keys == 2 && st.live_bytes == 57 && st.dead_bytes == 0);
+    CHECK(st.compactions == 1);
+    CHECK(st.disk_bytes > 57); /* plus the hint file */
+    CHECK_RC(kv_close(db), KV_OK);
+
+    db = open_db(dir, &o); /* the numbers are rebuilt on recovery */
+    kv_get_stats(db, &st);
+    CHECK(st.keys == 2 && st.live_bytes == 57 && st.dead_bytes == 0);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
+static void test_auto_compaction(const char *dir)
+{
+    kv_options o = small_opts(4096);
+    o.auto_compact_ratio = 0.5;
+    kv_t *db = open_db(dir, &o);
+    kv_stats st;
+    char k[16], v[64];
+    int rounds = 0;
+    do {
+        for (int i = 0; i < 50; i++) {
+            snprintf(k, sizeof k, "k%d", i);
+            snprintf(v, sizeof v, "round %d of key %d, padded out a bit", rounds,
+                     i);
+            put_s(db, k, v);
+        }
+        rounds++;
+        kv_get_stats(db, &st);
+        if (st.compactions == 0)
+            tu_sleep_us(1000);
+    } while (st.compactions < 3 && rounds < 5000);
+    CHECK(st.compactions >= 3);
+    for (int i = 0; i < 50; i++) {
+        snprintf(k, sizeof k, "k%d", i);
+        snprintf(v, sizeof v, "round %d of key %d, padded out a bit",
+                 rounds - 1, i);
+        expect(db, k, v);
+    }
+    /* garbage stays bounded instead of growing with every round */
+    CHECK(st.disk_bytes < 40u * 4096u);
+    CHECK_RC(kv_close(db), KV_OK); /* joins the background thread */
+    o.auto_compact_ratio = 0;
+    db = open_db(dir, &o);
+    CHECK(kv_count(db) == 50);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
+static void test_bad_options(const char *dir)
+{
+    kv_options o;
+    kv_t *db;
+    kv_default_options(&o);
+    o.auto_compact_ratio = 1.5;
+    CHECK_RC(kv_open(dir, &o, &db), KV_ERR_INVALID);
+    kv_default_options(&o);
+    o.sync_policy = (kv_sync_policy)42;
+    CHECK_RC(kv_open(dir, &o, &db), KV_ERR_INVALID);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -598,6 +721,11 @@ int main(void)
         {"crash states during compaction", test_compaction_crash_states},
         {"garbage files ignored", test_garbage_files_ignored},
         {"sync policies", test_sync_policies},
+        {"lock: same process", test_lock_same_process},
+        {"lock: other process", test_lock_other_process},
+        {"stats", test_stats},
+        {"background compaction", test_auto_compaction},
+        {"bad options", test_bad_options},
     };
     return tu_run("test_kv", tests, sizeof tests / sizeof *tests);
 }

@@ -124,10 +124,143 @@ static void test_readers_writer_compactor(const char *dir)
     pthread_mutex_destroy(&s.mu);
 }
 
+
+/*
+ * Compaction must not stop the world: with a big store being compacted, puts
+ * and gets issued meanwhile have to complete before compaction does.
+ */
+typedef struct {
+    kv_t *db;
+    atomic_int started, done;
+    long puts_during, gets_during;
+} bg_compact;
+
+static void *compact_thread(void *arg)
+{
+    bg_compact *b = arg;
+    atomic_store(&b->started, 1);
+    CHECK_RC(kv_compact(b->db), KV_OK);
+    atomic_store(&b->done, 1);
+    return NULL;
+}
+
+static void test_ops_during_compaction(const char *dir)
+{
+    kv_options o;
+    kv_default_options(&o);
+    o.sync_policy = KV_SYNC_NONE;
+    o.segment_size = 4u << 20;
+    bg_compact b = {0};
+    CHECK_RC(kv_open(dir, &o, &b.db), KV_OK);
+    char k[32];
+    static char val[2048];
+    memset(val, 'v', sizeof val);
+    for (int round = 0; round < 3; round++) /* ~90 MB, 2/3 of it garbage */
+        for (int i = 0; i < 15000; i++) {
+            snprintf(k, sizeof k, "key-%05d", i);
+            CHECK_RC(kv_put(b.db, k, strlen(k), val, sizeof val), KV_OK);
+        }
+
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, compact_thread, &b) == 0);
+    while (!atomic_load(&b.started))
+        ;
+    int i = 0;
+    while (!atomic_load(&b.done)) {
+        snprintf(k, sizeof k, "new-%d", i);
+        CHECK_RC(kv_put(b.db, k, strlen(k), "fresh", 5), KV_OK);
+        if (!atomic_load(&b.done))
+            b.puts_during++;
+        void *v;
+        size_t n;
+        snprintf(k, sizeof k, "key-%05d", i % 15000);
+        CHECK_RC(kv_get(b.db, k, strlen(k), &v, &n), KV_OK);
+        CHECK(n == sizeof val && memcmp(v, val, n) == 0);
+        free(v);
+        if (!atomic_load(&b.done))
+            b.gets_during++;
+        i++;
+    }
+    pthread_join(th, NULL);
+    printf("[%ld puts, %ld gets during compaction] ", b.puts_during,
+           b.gets_during);
+    CHECK(b.puts_during > 100 && b.gets_during > 100);
+
+    for (int j = 0; j < i; j++) {
+        snprintf(k, sizeof k, "new-%d", j);
+        void *v;
+        size_t n;
+        CHECK_RC(kv_get(b.db, k, strlen(k), &v, &n), KV_OK);
+        CHECK(n == 5 && memcmp(v, "fresh", 5) == 0);
+        free(v);
+    }
+    CHECK(kv_count(b.db) == 15000u + (size_t)i);
+    CHECK_RC(kv_close(b.db), KV_OK);
+    CHECK_RC(kv_open(dir, &o, &b.db), KV_OK);
+    CHECK(kv_count(b.db) == 15000u + (size_t)i);
+    CHECK_RC(kv_close(b.db), KV_OK);
+}
+
+/* Many writers with an fsync per write, plus explicit syncs: every write
+ * must land exactly once, and none may return before its group commit. */
+typedef struct {
+    kv_t *db;
+    int id;
+} gc_arg;
+
+static void *gc_writer(void *arg)
+{
+    gc_arg *g = arg;
+    char k[32], v[32];
+    for (int i = 0; i < 300; i++) {
+        snprintf(k, sizeof k, "w%d-%d", g->id, i);
+        snprintf(v, sizeof v, "value %d", i);
+        CHECK_RC(kv_put(g->db, k, strlen(k), v, strlen(v)), KV_OK);
+        if (i % 50 == 0)
+            CHECK_RC(kv_sync(g->db), KV_OK);
+        if (i % 3 == 0)
+            CHECK_RC(kv_delete(g->db, k, strlen(k)), KV_OK);
+    }
+    return NULL;
+}
+
+static void test_group_commit(const char *dir)
+{
+    kv_options o;
+    kv_default_options(&o);
+    o.sync_policy = KV_SYNC_ALWAYS;
+    o.segment_size = 16 * 1024; /* rollovers race with group commits */
+    kv_t *db;
+    CHECK_RC(kv_open(dir, &o, &db), KV_OK);
+    enum { NW = 8 };
+    pthread_t th[NW];
+    gc_arg args[NW];
+    for (int i = 0; i < NW; i++) {
+        args[i] = (gc_arg){db, i};
+        CHECK(pthread_create(&th[i], NULL, gc_writer, &args[i]) == 0);
+    }
+    for (int i = 0; i < NW; i++)
+        pthread_join(th[i], NULL);
+    kv_stats st;
+    kv_get_stats(db, &st);
+    CHECK(st.puts == NW * 300 && st.deletes == NW * 100);
+    CHECK(st.keys == NW * 200);
+    CHECK(st.syncs > 0 && st.syncs <= st.puts + st.deletes + 64);
+    printf("[%llu writes, %llu fsyncs] ",
+           (unsigned long long)(st.puts + st.deletes),
+           (unsigned long long)st.syncs);
+    CHECK_RC(kv_close(db), KV_OK);
+    CHECK_RC(kv_open(dir, &o, &db), KV_OK);
+    CHECK(kv_count(db) == NW * 200);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
         {"readers + writer + compactor", test_readers_writer_compactor},
+        {"ops complete during compaction", test_ops_during_compaction},
+        {"group commit, 8 fsync-always writers", test_group_commit},
     };
     return tu_run("test_concurrency", tests, sizeof tests / sizeof *tests);
 }
