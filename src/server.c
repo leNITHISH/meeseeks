@@ -405,12 +405,14 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s [-d dir] [-H host] [-p port] [-s always|batch|none] "
-            "[-n N]\n"
+            "[-n N] [-c ratio]\n"
             "  -d  data directory (default ./data)\n"
             "  -H  listen address (default 127.0.0.1)\n"
             "  -p  port (default 7379)\n"
             "  -s  fsync policy (default batch)\n"
-            "  -n  writes per fsync for -s batch (default 100)\n",
+            "  -n  writes per fsync for -s batch (default 100)\n"
+            "  -c  compact in the background once this fraction of the log\n"
+            "      is garbage (default 0.5; 0 turns it off)\n",
             prog);
 }
 
@@ -420,7 +422,8 @@ int main(int argc, char **argv)
     int port = 7379, opt;
     kv_options o;
     kv_default_options(&o);
-    while ((opt = getopt(argc, argv, "d:H:p:s:n:h")) != -1) {
+    o.auto_compact_ratio = 0.5; /* a long-running server must reclaim space */
+    while ((opt = getopt(argc, argv, "d:H:p:s:n:c:h")) != -1) {
         switch (opt) {
         case 'd':
             dir = optarg;
@@ -445,6 +448,9 @@ int main(int argc, char **argv)
             break;
         case 'n':
             o.sync_every_n = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'c':
+            o.auto_compact_ratio = strtod(optarg, NULL);
             break;
         default:
             usage(argv[0]);
@@ -479,6 +485,13 @@ int main(int argc, char **argv)
     fflush(stdout);
     rc = server_serve(db, g_listen_fd);
     close(g_listen_fd);
+    kv_stats st;
+    kv_get_stats(db, &st);
+    printf("kvserver: %llu puts, %llu deletes, %llu compactions; %llu keys, "
+           "%.1f MiB on disk\n",
+           (unsigned long long)st.puts, (unsigned long long)st.deletes,
+           (unsigned long long)st.compactions, (unsigned long long)st.keys,
+           (double)st.disk_bytes / (1024.0 * 1024.0));
     int crc = kv_close(db);
     printf("kvserver: shut down cleanly\n");
     return rc == 0 && crc == KV_OK ? 0 : 1;

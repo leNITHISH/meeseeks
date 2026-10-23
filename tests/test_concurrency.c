@@ -255,12 +255,70 @@ static void test_group_commit(const char *dir)
     CHECK_RC(kv_close(db), KV_OK);
 }
 
+/*
+ * Background compaction must keep up even when writers never pause; it has
+ * to win the writer mutex to seal the active segment each time.
+ */
+typedef struct {
+    kv_t *db;
+    int id;
+    atomic_int *stop;
+} hw_arg;
+
+static void *hammer_writer(void *arg)
+{
+    hw_arg *a = arg;
+    char k[32];
+    static const char v[512] = {0};
+    for (unsigned i = 0; !atomic_load(a->stop); i++) {
+        snprintf(k, sizeof k, "w%d-%u", a->id, i % 200);
+        CHECK_RC(kv_put(a->db, k, strlen(k), v, sizeof v), KV_OK);
+    }
+    return NULL;
+}
+
+static void test_compactor_not_starved(const char *dir)
+{
+    kv_options o;
+    kv_default_options(&o);
+    o.sync_policy = KV_SYNC_NONE;
+    o.segment_size = 256 * 1024;
+    o.auto_compact_ratio = 0.5;
+    kv_t *db;
+    CHECK_RC(kv_open(dir, &o, &db), KV_OK);
+    enum { NW = 4 };
+    atomic_int stop = 0;
+    pthread_t th[NW];
+    hw_arg args[NW];
+    for (int i = 0; i < NW; i++) {
+        args[i] = (hw_arg){db, i, &stop};
+        CHECK(pthread_create(&th[i], NULL, hammer_writer, &args[i]) == 0);
+    }
+    kv_stats st;
+    for (int ms = 0; ms < 5000; ms += 10) {
+        tu_sleep_us(10000);
+        kv_get_stats(db, &st);
+        if (st.compactions >= 3)
+            break;
+    }
+    atomic_store(&stop, 1);
+    for (int i = 0; i < NW; i++)
+        pthread_join(th[i], NULL);
+    kv_get_stats(db, &st);
+    printf("[%llu compactions, %.1f MiB on disk] ",
+           (unsigned long long)st.compactions,
+           (double)st.disk_bytes / (1024.0 * 1024.0));
+    CHECK(st.compactions >= 3);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
         {"readers + writer + compactor", test_readers_writer_compactor},
         {"ops complete during compaction", test_ops_during_compaction},
         {"group commit, 8 fsync-always writers", test_group_commit},
+        {"compactor not starved by writers", test_compactor_not_starved},
     };
     return tu_run("test_concurrency", tests, sizeof tests / sizeof *tests);
 }
