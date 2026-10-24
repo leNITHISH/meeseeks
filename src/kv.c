@@ -770,6 +770,9 @@ int kv_get(kv_t *db, const void *key, size_t klen, void **val, size_t *vlen)
  */
 #define SCAN_BATCH_KEYS 512u /* per read-lock hold, like compaction's */
 #define SCAN_BATCH_BYTES (1u << 20)
+/* Entries looked at per hold, live or free: after mass deletes most can be
+ * free, and a writer waiting to publish should not wait for all of them. */
+#define SCAN_BATCH_ENTRIES 4096u
 
 typedef struct {
     uint32_t entry, len;
@@ -791,7 +794,9 @@ int kv_scan_from(kv_t *db, uint64_t *cursor, size_t max_keys, kv_scan_fn fn,
         size_t nk = 0, used = 0;
         kv_read_lock(db);
         limit = index_entry_limit(&db->idx);
-        for (; n < limit && nk < SCAN_BATCH_KEYS && nk < left; n++) {
+        uint64_t stop = n + SCAN_BATCH_ENTRIES < limit ? n + SCAN_BATCH_ENTRIES
+                                                       : limit;
+        for (; n < stop && nk < SCAN_BATCH_KEYS && nk < left; n++) {
             uint32_t klen;
             const uint8_t *k = index_entry_key(&db->idx, (uint32_t)n, &klen);
             if (!k)

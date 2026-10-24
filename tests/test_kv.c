@@ -1153,6 +1153,32 @@ static void test_scan(const char *dir)
     CHECK_RC(kv_scan_from(db, &cursor, 0, tally, t), KV_OK);
     CHECK(cursor == 0);
 
+    /* Mostly free entries: whole lock holds find no key, and the walk must
+     * go on past them, in kv_scan and one key at a time alike. */
+    char big[32];
+    for (int i = 0; i < 20000; i++) {
+        snprintf(big, sizeof big, "doomed-%d", i);
+        CHECK_RC(kv_put(db, big, strlen(big), "v", 1), KV_OK);
+    }
+    for (int i = 0; i < 20000; i++) {
+        snprintf(big, sizeof big, "doomed-%d", i);
+        if (i != 7 && i != 19999)
+            CHECK_RC(kv_delete(db, big, strlen(big)), KV_OK);
+    }
+    memset(t, 0, sizeof *t);
+    CHECK_RC(kv_scan(db, tally, t), KV_OK);
+    check_tally(t, not_third);
+    CHECK(t->others == 4);
+    memset(t, 0, sizeof *t);
+    cursor = 0;
+    do
+        CHECK_RC(kv_scan_from(db, &cursor, 1, tally, t), KV_OK);
+    while (cursor != 0);
+    check_tally(t, not_third);
+    CHECK(t->others == 4);
+    CHECK_RC(kv_delete(db, "doomed-7", 8), KV_OK);
+    CHECK_RC(kv_delete(db, "doomed-19999", 12), KV_OK);
+
     /* The callback may write: no lock is held while it runs. Keys that
      * exist for the whole scan are still visited exactly once each. */
     memset(t, 0, sizeof *t);
