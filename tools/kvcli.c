@@ -5,8 +5,8 @@
  *   kvcli -h HOST -p PORT [command...]   talk to a running kvserver
  *
  * Commands are those of the server protocol (GET, SET, DEL, SCAN, STATS,
- * COMPACT, SYNC, SCRUB, PING), plus KEYS [pattern], BACKUP DIR (local stores
- * only), HELP and QUIT. A local store answers through the same protocol
+ * COMPACT, SYNC, SCRUB, PING), plus KEYS [pattern], HELP and QUIT, and for
+ * local stores only BACKUP DIR, EXPORT FILE and IMPORT FILE. A local store answers through the same protocol
  * handler as the server, so both modes reply alike. Given a command on the
  * command line, kvcli runs just that one; otherwise it reads commands from
  * standard input a plain line at a time, with a prompt if that is a
@@ -16,6 +16,7 @@
  * opened or reached.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <fnmatch.h>
 #include <netdb.h>
 #include <signal.h>
@@ -25,6 +26,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "crc32.h"
 #include "kv.h"
 #include "server.h"
 
@@ -309,6 +311,203 @@ static int cmd_keys(cli *c, const char *pat)
     return 0;
 }
 
+/* ---------- export and import ---------- */
+
+/*
+ * EXPORT writes every key and value to a file in a format of its own, which
+ * does not change when the store's does:
+ *
+ *   "MEESEEKS-EXPORT 1\n"
+ *   per pair:  key size (u32), value size (u32), key, value
+ *   at the end: 0xFFFFFFFF (u32), number of pairs (u64), CRC-32 of every
+ *              byte between the first line and the 0xFFFFFFFF (u32)
+ *
+ * Integers are little-endian. Local kvcli holds the directory lock, so
+ * nothing else writes while EXPORT scans: the file is one consistent state.
+ * IMPORT reads the file twice, and writes nothing unless the first pass
+ * finds it whole.
+ */
+#define EXPORT_MAGIC "MEESEEKS-EXPORT 1\n"
+#define EXPORT_END 0xFFFFFFFFu
+
+static void le_put(uint8_t *b, uint64_t v, int n)
+{
+    for (int i = 0; i < n; i++)
+        b[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint64_t le_get(const uint8_t *b, int n)
+{
+    uint64_t v = 0;
+    for (int i = n - 1; i >= 0; i--)
+        v = v << 8 | b[i];
+    return v;
+}
+
+typedef struct {
+    kv_t *db;
+    FILE *f;
+    uint32_t crc;
+    unsigned long long count;
+    int rc; /* first failure */
+} exporter;
+
+static int export_one(void *ctx, const void *key, size_t klen)
+{
+    exporter *x = ctx;
+    void *v;
+    size_t vlen;
+    int rc = kv_get(x->db, key, klen, &v, &vlen);
+    if (rc == KV_NOT_FOUND)
+        return 0; /* deleted since the scan saw it; nobody else writes */
+    if (rc != KV_OK) {
+        x->rc = rc;
+        return 1;
+    }
+    uint8_t h[8];
+    le_put(h, klen, 4);
+    le_put(h + 4, vlen, 4);
+    x->crc = crc32_update(x->crc, h, 8);
+    x->crc = crc32_update(x->crc, key, klen);
+    x->crc = crc32_update(x->crc, v, vlen);
+    int bad = fwrite(h, 1, 8, x->f) != 8 ||
+              (klen && fwrite(key, 1, klen, x->f) != klen) ||
+              (vlen && fwrite(v, 1, vlen, x->f) != vlen);
+    free(v);
+    if (bad) {
+        x->rc = KV_ERR_IO;
+        return 1;
+    }
+    x->count++;
+    return 0;
+}
+
+static int cmd_export(kv_t *db, const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        printf("(error) cannot create %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    exporter x = {db, fdopen(fd, "wb"), 0, 0, KV_OK};
+    if (!x.f || fputs(EXPORT_MAGIC, x.f) < 0)
+        x.rc = KV_ERR_IO;
+    if (x.rc == KV_OK) {
+        int r = kv_scan(db, export_one, &x);
+        if (x.rc == KV_OK && r < 0)
+            x.rc = r;
+    }
+    uint8_t t[16];
+    le_put(t, EXPORT_END, 4);
+    le_put(t + 4, x.count, 8);
+    le_put(t + 12, x.crc, 4);
+    if (x.rc == KV_OK && (fwrite(t, 1, sizeof t, x.f) != sizeof t ||
+                          fflush(x.f) != 0 || fsync(fd) != 0))
+        x.rc = KV_ERR_IO;
+    if (x.f ? fclose(x.f) != 0 : close(fd) != 0)
+        x.rc = x.rc == KV_OK ? KV_ERR_IO : x.rc;
+    if (x.rc != KV_OK) {
+        unlink(path);
+        printf("(error) export failed: %s\n", kv_strerror(x.rc));
+        return 1;
+    }
+    printf("OK (%llu key%s)\n", x.count, x.count == 1 ? "" : "s");
+    return 0;
+}
+
+/* Read n bytes into b, adding them to the checksum. 0, or -1. */
+static int read_bytes(FILE *f, sbuf *b, size_t n, uint32_t *crc)
+{
+    if (n + 1 > b->cap) {
+        char *d = realloc(b->data, n + 1);
+        if (!d)
+            return -1;
+        b->data = d;
+        b->cap = n + 1;
+    }
+    if (n && fread(b->data, 1, n, f) != n)
+        return -1;
+    b->len = n;
+    *crc = crc32_update(*crc, b->data, n);
+    return 0;
+}
+
+/* The next pair: 1, 0 at the end marker, -1 if the file is cut short or
+ * holds sizes no store allows. */
+static int read_pair(FILE *f, uint32_t *crc, sbuf *k, sbuf *v)
+{
+    uint8_t h[8];
+    if (fread(h, 1, 4, f) != 4)
+        return -1;
+    if (le_get(h, 4) == EXPORT_END)
+        return 0;
+    if (fread(h + 4, 1, 4, f) != 4)
+        return -1;
+    *crc = crc32_update(*crc, h, 8);
+    uint64_t klen = le_get(h, 4), vlen = le_get(h + 4, 4);
+    if (klen > KV_MAX_KEY_SIZE || vlen > KV_MAX_VALUE_SIZE ||
+        read_bytes(f, k, (size_t)klen, crc) != 0 ||
+        read_bytes(f, v, (size_t)vlen, crc) != 0)
+        return -1;
+    return 1;
+}
+
+static int cmd_import(kv_t *db, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        printf("(error) cannot open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    sbuf k = {0}, v = {0};
+    unsigned long long n = 0;
+    int status = 0;
+    for (int pass = 0; pass < 2 && status == 0; pass++) {
+        /* pass 0 checks the whole file, pass 1 stores it */
+        char magic[sizeof EXPORT_MAGIC - 1];
+        uint32_t crc = 0;
+        int r = 0;
+        rewind(f);
+        n = 0;
+        if (fread(magic, 1, sizeof magic, f) == sizeof magic &&
+            memcmp(magic, EXPORT_MAGIC, sizeof magic) == 0) {
+            while ((r = read_pair(f, &crc, &k, &v)) == 1) {
+                int rc = pass ? kv_put(db, k.data, k.len, v.data, v.len) : KV_OK;
+                if (rc != KV_OK) {
+                    printf("(error) import failed after %llu keys: %s\n", n,
+                           kv_strerror(rc));
+                    status = 1;
+                    break;
+                }
+                n++;
+            }
+        } else {
+            r = -1;
+        }
+        uint8_t t[12];
+        if (status == 0 && pass == 0 &&
+            (r != 0 || fread(t, 1, sizeof t, f) != sizeof t ||
+             le_get(t, 8) != n || le_get(t + 8, 4) != crc || fgetc(f) != EOF)) {
+            printf("(error) %s is not a whole kvcli export; nothing was "
+                   "imported\n",
+                   path);
+            status = 1;
+        }
+    }
+    fclose(f);
+    sbuf_free(&k);
+    sbuf_free(&v);
+    if (status == 0) {
+        int rc = kv_sync(db);
+        if (rc != KV_OK) {
+            printf("(error) %s\n", kv_strerror(rc));
+            return 1;
+        }
+        printf("OK (%llu key%s)\n", n, n == 1 ? "" : "s");
+    }
+    return status;
+}
+
 static void help(void)
 {
     puts("GET key              print the value of key\n"
@@ -321,6 +520,9 @@ static void help(void)
          "SYNC                 make every write so far durable\n"
          "SCRUB                read every sealed segment back and check it\n"
          "BACKUP dir           copy the store to a new directory (local only)\n"
+         "EXPORT file          write every key and value to a new file (local)\n"
+         "IMPORT file          store every pair in an EXPORT file, replacing\n"
+         "                     keys that exist already (local)\n"
          "PING                 check that the store answers\n"
          "QUIT                 leave");
 }
@@ -359,6 +561,20 @@ static int run_line(cli *c, char *line, size_t len)
             return 1;
         }
         return cmd_keys(c, *arg ? arg : NULL);
+    }
+    if (word_is(cmd, clen, "EXPORT") || word_is(cmd, clen, "IMPORT")) {
+        const char *name = word_is(cmd, clen, "EXPORT") ? "EXPORT" : "IMPORT";
+        if (c->fd >= 0) {
+            printf("(error) %s needs the store itself: run kvcli DIR on the "
+                   "server's host\n",
+                   name);
+            return 1;
+        }
+        if (!*arg || strpbrk(arg, " \t")) {
+            printf("(error) usage: %s file\n", name);
+            return 1;
+        }
+        return name[0] == 'E' ? cmd_export(c->db, arg) : cmd_import(c->db, arg);
     }
     if (word_is(cmd, clen, "BACKUP")) {
         if (c->fd >= 0) {

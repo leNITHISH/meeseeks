@@ -284,6 +284,123 @@ static void test_locked(const char *dir)
     CHECK_RC(kv_close(db), KV_OK);
 }
 
+/* ---------- EXPORT and IMPORT ---------- */
+
+static const struct {
+    const char *k;
+    size_t klen;
+    const char *v;
+    size_t vlen;
+} odd_pairs[] = {
+    {"plain", 5, "value", 5},
+    {"", 0, "the empty key", 13},
+    {"two words", 9, "line\nbreak", 10},
+    {"cr\rlf\n", 6, "nul\0byte", 8},
+    {"nul\0key", 7, "", 0},
+};
+enum { NODD = sizeof odd_pairs / sizeof *odd_pairs, BIG = 1536 * 1024 };
+
+static void check_imported(const char *dir, const uint8_t *big)
+{
+    kv_t *db;
+    CHECK_RC(kv_open(dir, NULL, &db), KV_OK);
+    CHECK(kv_count(db) == NODD + 1);
+    for (size_t i = 0; i < NODD; i++) {
+        void *v;
+        size_t n;
+        CHECK_RC(kv_get(db, odd_pairs[i].k, odd_pairs[i].klen, &v, &n), KV_OK);
+        CHECK(n == odd_pairs[i].vlen && memcmp(v, odd_pairs[i].v, n) == 0);
+        free(v);
+    }
+    void *v;
+    size_t n;
+    CHECK_RC(kv_get(db, "big", 3, &v, &n), KV_OK);
+    CHECK(n == BIG && memcmp(v, big, n) == 0);
+    free(v);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
+static void write_file(const char *path, const uint8_t *p, size_t n)
+{
+    FILE *f = fopen(path, "wb");
+    CHECK(f && fwrite(p, 1, n, f) == n && fclose(f) == 0);
+}
+
+static void test_export_import(const char *dir)
+{
+    uint8_t *big = malloc(BIG);
+    CHECK(big);
+    for (size_t i = 0; i < BIG; i++)
+        big[i] = (uint8_t)(i * 7 + i / 1000);
+    kv_t *db;
+    CHECK_RC(kv_open(dir, NULL, &db), KV_OK);
+    for (size_t i = 0; i < NODD; i++)
+        CHECK_RC(kv_put(db, odd_pairs[i].k, odd_pairs[i].klen, odd_pairs[i].v,
+                        odd_pairs[i].vlen),
+                 KV_OK);
+    CHECK_RC(kv_put(db, "big", 3, big, BIG), KV_OK);
+    CHECK_RC(kv_put(db, "gone", 4, "x", 1), KV_OK);
+    CHECK_RC(kv_delete(db, "gone", 4), KV_OK);
+    CHECK_RC(kv_close(db), KV_OK);
+
+    char file[300], into[300];
+    snprintf(file, sizeof file, "%s-export", dir);
+    snprintf(into, sizeof into, "%s-into", dir);
+    char *out, *err;
+    const char *exp[] = {dir, "EXPORT", file, NULL};
+    CHECK(run_cli(dir, exp, "", &out, &err) == 0);
+    expect_output("export", out, "OK (6 keys)\n");
+    free(out);
+    free(err);
+    CHECK(run_cli(dir, exp, "", &out, &err) == 1); /* never overwrites */
+    CHECK(strncmp(out, "(error) cannot create ", 22) == 0);
+    free(out);
+    free(err);
+
+    /* Into a fresh store, and again on top of it: imports replace. */
+    const char *imp[] = {into, "IMPORT", file, NULL};
+    for (int round = 0; round < 2; round++) {
+        CHECK(run_cli(dir, imp, "", &out, &err) == 0);
+        expect_output("import", out, "OK (6 keys)\n");
+        free(out);
+        free(err);
+        check_imported(into, big);
+    }
+    tu_rmrf(into);
+
+    /* A file cut short anywhere, or with one bit flipped, imports nothing. */
+    off_t size = tu_file_size(file);
+    uint8_t *whole = malloc((size_t)size);
+    CHECK(whole);
+    FILE *f = fopen(file, "rb");
+    CHECK(f && fread(whole, 1, (size_t)size, f) == (size_t)size);
+    fclose(f);
+    char damaged[320];
+    snprintf(damaged, sizeof damaged, "%s-damaged", dir);
+    const char *dmg[] = {into, "IMPORT", damaged, NULL};
+    const off_t cuts[] = {0, 10, 18, 30, size / 2, size - 16, size - 1};
+    for (int i = 0; i < 8; i++) {
+        if (i < 7) {
+            write_file(damaged, whole, (size_t)cuts[i]);
+        } else {
+            whole[size / 2] ^= 0x10; /* inside the big value */
+            write_file(damaged, whole, (size_t)size);
+        }
+        CHECK(run_cli(dir, dmg, "", &out, &err) == 1);
+        CHECK(strstr(out, "is not a whole kvcli export; nothing was imported"));
+        free(out);
+        free(err);
+        CHECK_RC(kv_open(into, NULL, &db), KV_OK);
+        CHECK(kv_count(db) == 0);
+        CHECK_RC(kv_close(db), KV_OK);
+    }
+    unlink(damaged);
+    unlink(file);
+    tu_rmrf(into);
+    free(whole);
+    free(big);
+}
+
 typedef struct {
     kv_t *db;
     int fd;
@@ -323,6 +440,12 @@ static void test_remote(const char *dir)
     CHECK(strncmp(out, refused, sizeof refused - 1) == 0);
     free(out);
     free(err);
+    const char *ex[] = {"-p", ps, "EXPORT", "/tmp/x", NULL};
+    CHECK(run_cli(dir, ex, "", &out, &err) == 1);
+    const char no_export[] = "(error) EXPORT needs the store itself";
+    CHECK(strncmp(out, no_export, sizeof no_export - 1) == 0);
+    free(out);
+    free(err);
 
     server_stop(s.fd);
     pthread_join(th, NULL);
@@ -350,6 +473,7 @@ int main(int argc, char **argv)
         {"local store", test_local},
         {"KEYS over many batches", test_many_keys},
         {"directory open elsewhere", test_locked},
+        {"EXPORT and IMPORT round trip", test_export_import},
         {"remote server, same answers", test_remote},
     };
     return tu_run("test_cli", tests, sizeof tests / sizeof *tests);

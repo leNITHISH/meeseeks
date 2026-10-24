@@ -2,7 +2,7 @@
 
 Version 1.0 does what the project set out to do: a Bitcask-style store that survives crashes, with the tests to show it. This is the work planned after it, roughly in the order I expect to do it. Each item has to clear the same bar as the rest of the store. If it touches what is on disk, the power-failure checker has to cover it before it ships.
 
-Done since 1.0: the interactive shell (`kvcli`), key iteration (`kv_scan()` and the server's `SCAN`), and scrubbing (`kv_scrub()` and a background scrubber). None of them changed the on-disk format.
+Done since 1.0: the interactive shell (`kvcli`), key iteration (`kv_scan()` and the server's `SCAN`), scrubbing (`kv_scrub()` and a background scrubber), and a logical export and import in `kvcli`. None of them changed the on-disk format.
 
 ## Atomic batches
 
@@ -30,6 +30,6 @@ The text protocol cannot carry line breaks in keys or values, and every client n
 
 ## Smaller ideas
 
-- A logical export and import, every key and value, for moving data between versions of the format. It would be built on `kv_scan()` and run against a `kv_backup()` taken first, so that it sees one consistent state while the store keeps running.
+- Export from a running server. `kvcli EXPORT` needs the directory itself today; a server could export a `kv_backup()` taken first, so it sees one consistent state while it keeps serving.
 - Streaming or ranged reads, so a large value does not have to be read and allocated whole.
 - Optional per-record compression for large values.
