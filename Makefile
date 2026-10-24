@@ -149,7 +149,7 @@ bench-quick: $(BENCH)
 	$(BENCH) --dir $(BENCH_DIR) --quick
 
 coverage:
-	rm -f build/coverage/obj/*.gcda
+	rm -f build/coverage/obj/*.gcda build/coverage/*.gcda # stale counts break merging
 	$(MAKE) MODE=coverage test
 	@cd build/coverage/obj && for f in $(LIB_SRC:src/%.c=%); do \
 	  gcov -n -o . ../../../src/$$f.c 2>/dev/null | \
