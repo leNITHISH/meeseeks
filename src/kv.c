@@ -794,8 +794,9 @@ int kv_scan_from(kv_t *db, uint64_t *cursor, size_t max_keys, kv_scan_fn fn,
         size_t nk = 0, used = 0;
         kv_read_lock(db);
         limit = index_entry_limit(&db->idx);
-        uint64_t stop = n + SCAN_BATCH_ENTRIES < limit ? n + SCAN_BATCH_ENTRIES
-                                                       : limit;
+        uint64_t stop = n < limit && limit - n > SCAN_BATCH_ENTRIES
+                            ? n + SCAN_BATCH_ENTRIES
+                            : limit;
         for (; n < stop && nk < SCAN_BATCH_KEYS && nk < left; n++) {
             uint32_t klen;
             const uint8_t *k = index_entry_key(&db->idx, (uint32_t)n, &klen);
