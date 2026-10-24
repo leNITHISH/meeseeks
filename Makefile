@@ -1,6 +1,6 @@
 # meeseeks: crash-safe log-structured KV store
 #
-#   make            release build (lib, server, tests, bench)
+#   make            release build (lib, server, kvtool, kvcli, tests, bench)
 #   make debug      -O0 -g build in build/debug
 #   make asan       AddressSanitizer + UBSan build in build/asan
 #   make tsan       ThreadSanitizer build in build/tsan
@@ -52,7 +52,8 @@ LIB_SRC := src/crc32.c src/record.c src/index.c src/io.c src/recovery.c \
 LIB_OBJ := $(LIB_SRC:src/%.c=$(B)/obj/%.o)
 LIB     := $(B)/libmeeseeks.a
 
-TESTS   := test_kv test_model test_crash test_kill test_faults test_concurrency test_server
+TESTS   := test_kv test_model test_crash test_kill test_faults test_concurrency test_server \
+           test_cli
 ifeq ($(shell uname -s),Linux)
   TESTS += test_powerfail test_fsyncfail  # need LD_PRELOAD interposition
 endif
@@ -60,11 +61,12 @@ TEST_BIN:= $(TESTS:%=$(B)/%)
 SERVER  := $(B)/kvserver
 BENCH   := $(B)/bench
 KVTOOL  := $(B)/kvtool
+KVCLI   := $(B)/kvcli
 LOADGEN := $(B)/loadgen
 
 .PHONY: all debug asan tsan test test-asan test-tsan coverage bench bench-quick fuzz clean
 
-all: $(LIB) $(SERVER) $(KVTOOL) $(TEST_BIN) $(BENCH) $(LOADGEN)
+all: $(LIB) $(SERVER) $(KVTOOL) $(KVCLI) $(TEST_BIN) $(BENCH) $(LOADGEN)
 
 debug:
 	$(MAKE) MODE=debug all
@@ -87,6 +89,10 @@ $(SERVER): src/server.c $(LIB)
 $(B)/test_server: tests/test_server.c src/server.c tests/test_util.h $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_server.c src/server.c $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
+# test_cli runs the kvcli binary next to it, against a store and a server
+$(B)/test_cli: tests/test_cli.c src/server.c tests/test_util.h $(LIB) $(KVCLI)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_cli.c src/server.c $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
 # The power-failure recorder is never instrumented: sanitizer runtimes must
 # load before any LD_PRELOAD library, so test_powerfail skips itself there.
 $(B)/pf_shim.so: tests/pf_shim.c | $(B)/obj
@@ -106,6 +112,9 @@ $(B)/test_%: tests/test_%.c tests/test_util.h $(LIB)
 
 $(KVTOOL): tools/kvtool.c $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(KVCLI): tools/kvcli.c src/server.c src/server.h $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tools/kvcli.c src/server.c $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
 $(LOADGEN): bench/loadgen.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) $(LDLIBS) -o $@
