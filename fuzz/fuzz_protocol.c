@@ -1,7 +1,8 @@
 /*
  * libFuzzer target: arbitrary request lines into the protocol handler.
  * Every line must get exactly one well-formed response line, whatever bytes
- * it contains, and a GET must return what the last SET stored.
+ * it contains, a GET must return what the last SET stored, and a SCAN reply
+ * must be a cursor, a count and then keys that are each a single token.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,40 @@
 static kv_t *db;
 static char dir[256];
 static unsigned runs;
+
+/* Does the line's first token spell SET? SYNC and COMPACT answer OK too. */
+static int is_set(const char *line, size_t len)
+{
+    size_t i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t'))
+        i++;
+    return len - i >= 4 && (line[i] | 0x20) == 's' &&
+           (line[i + 1] | 0x20) == 'e' && (line[i + 2] | 0x20) == 't' &&
+           (line[i + 3] == ' ' || line[i + 3] == '\t');
+}
+
+/* "KEYS <cursor> <omitted>" and then keys, each one space and a token. */
+static void check_keys_reply(const sbuf *out)
+{
+    const char *p = out->data + 5, *end = out->data + out->len - 1;
+    for (int field = 0; field < 2; field++) {
+        if (p == end || *p < '0' || *p > '9')
+            abort();
+        while (p < end && *p >= '0' && *p <= '9')
+            p++;
+        if (field == 0 && (p == end || *p++ != ' '))
+            abort();
+    }
+    while (p < end) {
+        if (*p++ != ' ' || p == end || *p == ' ')
+            abort();
+        while (p < end && *p != ' ') {
+            if (*p == '\t' || *p == '\r')
+                abort();
+            p++;
+        }
+    }
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
@@ -47,12 +82,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         if (!(out.len >= 3 && memcmp(out.data, "OK\n", 3) == 0) &&
             !(out.len >= 6 && memcmp(out.data, "VALUE ", 6) == 0) &&
             !(out.len >= 10 && memcmp(out.data, "NOT_FOUND\n", 10) == 0) &&
-            !(out.len >= 4 && memcmp(out.data, "ERR ", 4) == 0))
+            !(out.len >= 4 && memcmp(out.data, "ERR ", 4) == 0) &&
+            !(out.len >= 5 && memcmp(out.data, "KEYS ", 5) == 0) &&
+            !(out.len >= 6 && memcmp(out.data, "STATS ", 6) == 0) &&
+            !(out.len == 5 && memcmp(out.data, "PONG\n", 5) == 0))
             abort();
+        if (out.len >= 5 && memcmp(out.data, "KEYS ", 5) == 0)
+            check_keys_reply(&out);
 
         /* a successful SET must be readable right back */
         const char *line = (const char *)data + start;
-        if (len > 4 && out.len == 3 && (line[0] | 0x20) == 's') {
+        if (len > 4 && out.len == 3 && is_set(line, len)) {
             sbuf again = {0};
             char req[600];
             /* re-issue the key as a GET; skip keys too long for the buffer */

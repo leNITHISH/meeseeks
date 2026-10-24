@@ -71,6 +71,106 @@ static void test_protocol(const char *dir)
     CHECK_RC(kv_close(db), KV_OK);
 }
 
+/* Send a request and return the reply line, without its newline, in buf. */
+static void request(kv_t *db, const char *req, char *buf, size_t cap)
+{
+    sbuf out = {0};
+    CHECK(server_handle_line(db, req, strlen(req), &out) == 0);
+    CHECK(out.len > 0 && out.data[out.len - 1] == '\n' && out.len <= cap);
+    CHECK(memchr(out.data, '\n', out.len - 1) == NULL); /* one line */
+    memcpy(buf, out.data, out.len - 1);
+    buf[out.len - 1] = '\0';
+    sbuf_free(&out);
+}
+
+static void test_admin_commands(const char *dir)
+{
+    kv_t *db;
+    CHECK_RC(kv_open(dir, NULL, &db), KV_OK);
+    exchange(db, "PING", "PONG\n");
+    exchange(db, "ping  \r", "PONG\n");
+    exchange(db, "PING x", "ERR wrong number of arguments for 'PING'\n");
+    exchange(db, "SCAN 0", "KEYS 0 0\n"); /* empty store */
+    exchange(db, "SET a 1", "OK\n");
+    exchange(db, "SET b 2", "OK\n");
+    exchange(db, "DEL a", "OK\n");
+    exchange(db, "SYNC", "OK\n");
+    exchange(db, "COMPACT", "OK\n");
+    exchange(db, "compact extra", "ERR wrong number of arguments for 'COMPACT'\n");
+    exchange(db, "SCAN 0", "KEYS 0 0 b\n");
+
+    char line[1 << 17];
+    request(db, "STATS", line, sizeof line);
+    CHECK(strncmp(line, "STATS keys=1 segments=", 22) == 0);
+    CHECK(strstr(line, " puts=2 deletes=1 ") && strstr(line, " compactions=1 "));
+    CHECK(strstr(line, " index_bytes="));
+    exchange(db, "STATS now", "ERR wrong number of arguments for 'STATS'\n");
+
+    exchange(db, "SCAN", "ERR wrong number of arguments for 'SCAN'\n");
+    exchange(db, "SCAN 0 1 2", "ERR wrong number of arguments for 'SCAN'\n");
+    exchange(db, "SCAN x", "ERR cursor is not a number\n");
+    exchange(db, "SCAN -1", "ERR cursor is not a number\n");
+    exchange(db, "SCAN 99999999999999999999", "ERR cursor is not a number\n");
+    exchange(db, "SCAN 0 0", "ERR count is not a positive number\n");
+    exchange(db, "SCAN 0 ten", "ERR count is not a positive number\n");
+    exchange(db, "SCAN 18446744073709551615", "KEYS 0 0\n"); /* past the end */
+
+    /* Keys the protocol cannot carry are counted, not listed. */
+    CHECK_RC(kv_put(db, "two words", 9, "v", 1), KV_OK);
+    CHECK_RC(kv_put(db, "", 0, "v", 1), KV_OK);
+    CHECK_RC(kv_put(db, "line\nbreak", 10, "v", 1), KV_OK);
+    exchange(db, "SCAN 0", "KEYS 0 3 b\n");
+
+    /* Walk 1000 keys three at a time: each is listed exactly once. */
+    char req[64];
+    for (int i = 0; i < 1000; i++) {
+        snprintf(req, sizeof req, "SET key%d %d", i, i);
+        exchange(db, req, "OK\n");
+    }
+    char *seen = calloc(1000, 1);
+    CHECK(seen);
+    unsigned long long cursor = 0;
+    int listed = 0, calls = 0;
+    do {
+        snprintf(req, sizeof req, "SCAN %llu 3", cursor);
+        request(db, req, line, sizeof line);
+        char *save, *tok = strtok_r(line, " ", &save);
+        CHECK(tok && strcmp(tok, "KEYS") == 0);
+        cursor = strtoull(strtok_r(NULL, " ", &save), NULL, 10);
+        CHECK(strtok_r(NULL, " ", &save) != NULL); /* omitted */
+        int n = 0;
+        while ((tok = strtok_r(NULL, " ", &save)) != NULL) {
+            n++;
+            if (strcmp(tok, "b") == 0)
+                continue;
+            CHECK(strncmp(tok, "key", 3) == 0);
+            int i = atoi(tok + 3);
+            CHECK(i >= 0 && i < 1000 && !seen[i]);
+            seen[i] = 1;
+            listed++;
+        }
+        CHECK(n <= 3);
+        calls++;
+    } while (cursor != 0);
+    CHECK(listed == 1000 && calls >= 1001 / 3);
+    free(seen);
+
+    /* A big batch stops near SERVER_SCAN_BYTES instead of growing. */
+    char *big = malloc(40000);
+    CHECK(big);
+    for (int i = 0; i < 20; i++) {
+        memset(big, 'a' + i, 30000);
+        CHECK_RC(kv_put(db, big, 30000, "v", 1), KV_OK);
+    }
+    free(big);
+    sbuf out = {0};
+    CHECK(server_handle_line(db, "SCAN 0 100000", 13, &out) == 0);
+    CHECK(out.len < SERVER_SCAN_BYTES + 30000 + 64);
+    CHECK(strncmp(out.data, "KEYS 0 ", 7) != 0); /* more to come */
+    sbuf_free(&out);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
 /* ---------- over TCP ---------- */
 
 typedef struct {
@@ -376,6 +476,7 @@ int main(void)
     signal(SIGPIPE, SIG_IGN); /* where MSG_NOSIGNAL is missing */
     static const test_case tests[] = {
         {"protocol", test_protocol},
+        {"scan, stats, compact, sync, ping", test_admin_commands},
         {"tcp end-to-end", test_tcp},
         {"connection limit", test_connection_limit},
         {"large pipelined replies", test_large_pipelined_replies},

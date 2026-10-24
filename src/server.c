@@ -83,6 +83,152 @@ static int reply_err(sbuf *out, const char *fmt, const char *arg)
                                                                           : 0;
 }
 
+/* A decimal number filling the whole token. 0, or -1 if it is not one. */
+static int parse_u64(const char *p, size_t n, uint64_t *out)
+{
+    uint64_t v = 0;
+    if (n == 0)
+        return -1;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9')
+            return -1;
+        uint64_t d = (uint64_t)(p[i] - '0');
+        if (v > (UINT64_MAX - d) / 10)
+            return -1;
+        v = v * 10 + d;
+    }
+    *out = v;
+    return 0;
+}
+
+typedef struct {
+    sbuf keys;
+    uint64_t omitted;
+    int nomem;
+} scan_reply;
+
+/* Keys go into the reply as space-separated tokens. One that cannot be a
+ * token (empty, or holding a space, tab or line break) could only have been
+ * stored through the library; it is counted instead of listed. */
+static int scan_add(void *ctx, const void *key, size_t klen)
+{
+    scan_reply *r = ctx;
+    const char *k = key;
+    int token = klen > 0;
+    for (size_t i = 0; i < klen && token; i++)
+        token = !is_sep(k[i]) && k[i] != '\r' && k[i] != '\n';
+    if (!token) {
+        r->omitted++;
+    } else if (sb_puts(&r->keys, " ") || sb_append(&r->keys, k, klen)) {
+        r->nomem = 1;
+        return 1;
+    }
+    /* stop once the reply is big enough; the cursor resumes after this key */
+    return r->keys.len >= SERVER_SCAN_BYTES;
+}
+
+static int handle_scan(kv_t *db, const char *args, size_t len, sbuf *out)
+{
+    size_t i = 0, tok[2][2], ntok = 0;
+    while (ntok < 3) {
+        while (i < len && is_sep(args[i]))
+            i++;
+        if (i == len)
+            break;
+        size_t s = i;
+        while (i < len && !is_sep(args[i]))
+            i++;
+        if (ntok == 2) {
+            ntok = 3; /* too many */
+            break;
+        }
+        tok[ntok][0] = s;
+        tok[ntok][1] = i - s;
+        ntok++;
+    }
+    if (ntok < 1 || ntok > 2)
+        return reply_err(out, "wrong number of arguments for '%s'", "SCAN");
+    uint64_t cursor, count = SERVER_SCAN_COUNT;
+    if (parse_u64(args + tok[0][0], tok[0][1], &cursor) != 0)
+        return reply_err(out, "%s", "cursor is not a number");
+    if (ntok == 2 &&
+        (parse_u64(args + tok[1][0], tok[1][1], &count) != 0 || count == 0))
+        return reply_err(out, "%s", "count is not a positive number");
+
+    scan_reply r = {{0}, 0, 0};
+    int rc = kv_scan_from(db, &cursor, count > SIZE_MAX ? SIZE_MAX : count,
+                          scan_add, &r);
+    if (r.nomem) {
+        sbuf_free(&r.keys);
+        return -1;
+    }
+    if (rc < 0) {
+        sbuf_free(&r.keys);
+        return reply_err(out, "%s", kv_strerror(rc));
+    }
+    char hdr[64];
+    snprintf(hdr, sizeof hdr, "KEYS %llu %llu", (unsigned long long)cursor,
+             (unsigned long long)r.omitted);
+    int bad = sb_puts(out, hdr) ||
+              (r.keys.len && sb_append(out, r.keys.data, r.keys.len)) ||
+              sb_puts(out, "\n");
+    sbuf_free(&r.keys);
+    return bad ? -1 : 0;
+}
+
+static int handle_stats(kv_t *db, sbuf *out)
+{
+    kv_stats st;
+    kv_get_stats(db, &st);
+    char line[512];
+    snprintf(line, sizeof line,
+             "STATS keys=%llu segments=%llu disk_bytes=%llu live_bytes=%llu "
+             "dead_bytes=%llu puts=%llu deletes=%llu syncs=%llu "
+             "compactions=%llu index_bytes=%llu\n",
+             (unsigned long long)st.keys, (unsigned long long)st.segments,
+             (unsigned long long)st.disk_bytes,
+             (unsigned long long)st.live_bytes,
+             (unsigned long long)st.dead_bytes, (unsigned long long)st.puts,
+             (unsigned long long)st.deletes, (unsigned long long)st.syncs,
+             (unsigned long long)st.compactions,
+             (unsigned long long)st.index_bytes);
+    return sb_puts(out, line);
+}
+
+/* Commands that take no key: PING, STATS, COMPACT, SYNC, SCAN. Returns 1 if
+ * cmd is none of them, else what server_handle_line returns. */
+static int handle_keyless(kv_t *db, const char *cmd, size_t cmd_len,
+                          const char *args, size_t len, sbuf *out)
+{
+    static const char *const bare[] = {"PING", "STATS", "COMPACT", "SYNC"};
+    if (cmd_is(cmd, cmd_len, "SCAN"))
+        return handle_scan(db, args, len, out);
+    size_t which = 0;
+    while (which < 4 && !cmd_is(cmd, cmd_len, bare[which]))
+        which++;
+    if (which == 4)
+        return 1;
+    for (size_t i = 0; i < len; i++)
+        if (!is_sep(args[i]))
+            return reply_err(out, "wrong number of arguments for '%s'",
+                             bare[which]);
+    int rc;
+    switch (which) {
+    case 0:
+        return sb_puts(out, "PONG\n");
+    case 1:
+        return handle_stats(db, out);
+    case 2:
+        rc = kv_compact(db);
+        break;
+    default:
+        rc = kv_sync(db);
+        break;
+    }
+    return rc == KV_OK ? sb_puts(out, "OK\n")
+                       : reply_err(out, "%s", kv_strerror(rc));
+}
+
 int server_handle_line(kv_t *db, const char *line, size_t len, sbuf *out)
 {
     if (len && line[len - 1] == '\r')
@@ -98,6 +244,9 @@ int server_handle_line(kv_t *db, const char *line, size_t len, sbuf *out)
     if (cmd_len == 0)
         return reply_err(out, "%s", "empty command");
 
+    int k = handle_keyless(db, cmd, cmd_len, line + i, len - i, out);
+    if (k != 1)
+        return k;
     const char *name;
     if (cmd_is(cmd, cmd_len, "SET"))
         name = "SET";

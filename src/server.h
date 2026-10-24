@@ -6,12 +6,17 @@
 #include "kv.h"
 
 /*
- * Line-based text protocol, one request per line ("\n" or "\r\n"):
+ * Line-based text protocol, one request per line ("\n" or "\r\n") and one
+ * response line per request:
  *
- *   SET <key> <value>   -> OK
- *   GET <key>           -> VALUE <value>  |  NOT_FOUND
- *   DEL <key>           -> OK             |  NOT_FOUND
- *   anything malformed  -> ERR <reason>
+ *   SET <key> <value>     -> OK
+ *   GET <key>             -> VALUE <value>  |  NOT_FOUND
+ *   DEL <key>             -> OK             |  NOT_FOUND
+ *   SCAN <cursor> [count] -> KEYS <next-cursor> <omitted> <key>...
+ *   STATS                 -> STATS keys=<n> segments=<n> ...
+ *   COMPACT, SYNC         -> OK
+ *   PING                  -> PONG
+ *   anything malformed    -> ERR <reason>
  *
  * Keys are a single token without spaces or tabs. The value is the rest of
  * the line after the single space that follows the key, so it may contain
@@ -19,12 +24,22 @@
  * would be indistinguishable from a CRLF line ending. Commands are
  * case-insensitive. Requests may be pipelined; responses come back in
  * order.
+ *
+ * SCAN lists up to count keys (default SERVER_SCAN_COUNT, fewer once the
+ * reply passes SERVER_SCAN_BYTES), starting at cursor, 0 for the first call.
+ * Pass the next cursor to the next SCAN; it is 0 once every key has been
+ * listed. Keys that exist for the whole scan are listed exactly once.
+ * <omitted> counts keys in this batch that cannot be written as a token
+ * (empty, or holding whitespace or a line break), which only the library
+ * can store.
  */
 
 #define SERVER_MAX_LINE (1u << 20)
 #define SERVER_DEFAULT_MAX_CONNS 1024
 #define SERVER_FLUSH_BYTES (1u << 20) /* most reply bytes held per client */
 #define SERVER_DEFAULT_IDLE_MS 300000u
+#define SERVER_SCAN_COUNT 100
+#define SERVER_SCAN_BYTES (64u * 1024u) /* a SCAN reply stops growing here */
 
 typedef struct {
     char *data;
