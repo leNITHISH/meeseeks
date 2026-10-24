@@ -784,6 +784,60 @@ static void bench_memory(void)
     rmrf(g_dir);
 }
 
+/* ---------- scan and scrub ---------- */
+
+static int count_key(void *ctx, const void *key, size_t klen)
+{
+    (void)key;
+    (void)klen;
+    (*(uint64_t *)ctx)++;
+    return 0;
+}
+
+static void bench_scan(void)
+{
+    uint64_t nkeys = g_quick ? 10000 : 1000000;
+    printf("\n### Scan and scrub (%lluk keys, %d B values, page cache warm)\n\n",
+           (unsigned long long)(nkeys / 1000), VAL_LEN);
+    kv_t *db = fresh(KV_SYNC_NONE, 1);
+    load(db, nkeys, VAL_LEN);
+    int rc = kv_compact(db); /* everything in sealed segments, for scrub */
+    if (rc != KV_OK)
+        die("compact", rc);
+    double scan_s = 1e30, scrub_s = 1e30;
+    uint64_t scrubbed = 0;
+    for (int run = 0; run < 3; run++) { /* best of 3 */
+        uint64_t n = 0, t0 = now_ns();
+        rc = kv_scan(db, count_key, &n);
+        double s = (double)(now_ns() - t0) / 1e9;
+        if (rc != KV_OK || n != nkeys)
+            die("scan", rc != KV_OK ? rc : KV_ERR_CORRUPT);
+        scan_s = s < scan_s ? s : scan_s;
+
+        kv_stats st;
+        kv_get_stats(db, &st);
+        uint64_t before = st.scrub_bytes;
+        t0 = now_ns();
+        rc = kv_scrub(db);
+        s = (double)(now_ns() - t0) / 1e9;
+        if (rc != KV_OK)
+            die("scrub", rc);
+        kv_get_stats(db, &st);
+        scrubbed = st.scrub_bytes - before;
+        scrub_s = s < scrub_s ? s : scrub_s;
+    }
+    printf("| operation | covers | time | rate |\n|---|---:|---:|---:|\n");
+    printf("| `kv_scan`, every key | %llu keys | %.1f ms | %.1fM keys/s |\n",
+           (unsigned long long)nkeys, scan_s * 1000,
+           (double)nkeys / scan_s / 1e6);
+    printf("| `kv_scrub`, every sealed segment | %.1f MiB | %.1f ms | %.0f MiB/s "
+           "|\n",
+           mb(scrubbed), scrub_s * 1000, mb(scrubbed) / scrub_s);
+    fflush(stdout);
+    kv_close(db);
+    rmrf(g_dir);
+}
+
 /* ---------- main ---------- */
 
 static void print_env(void)
@@ -842,7 +896,7 @@ int main(int argc, char **argv)
         {"get", bench_get},         {"cold", bench_cold},
         {"compact", bench_compact},
         {"startup", bench_startup}, {"readers", bench_readers},
-        {"during", bench_during},
+        {"during", bench_during},   {"scan", bench_scan},
     };
     print_env();
     for (size_t s = 0; s < sizeof sections / sizeof *sections; s++) {
