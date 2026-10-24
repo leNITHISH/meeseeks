@@ -23,16 +23,16 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 ## Contents
 
 - [Quick start](#quick-start)
-- [How it works](#how-it-works): record format, segments, index, writes and durability, recovery, compaction, backups, concurrency
+- [How it works](#how-it-works): record format, segments, index, reads and scans, writes and durability, recovery, compaction, backups, scrubbing, concurrency
 - [Testing](#testing) and the bugs it found
 - [Benchmarks](#benchmarks)
-- [TCP server](#tcp-server) and [kvtool](#kvtool)
+- [TCP server](#tcp-server), [kvcli](#kvcli) and [kvtool](#kvtool)
 - [Known limitations](#known-limitations) and the [roadmap](ROADMAP.md)
 
 ## Quick start
 
 ```sh
-make            # library, server, kvtool, tests, benchmark (build/release)
+make            # library, server, kvcli, kvtool, tests, benchmark (build/release)
 make test       # full test suite, about 20 seconds
 make test-asan  # the suite under AddressSanitizer + UBSan
 make test-tsan  # concurrent tests under ThreadSanitizer
@@ -68,7 +68,9 @@ kv_compact(db);    /* reclaims space; reads and writes keep going */
 kv_close(db);
 ```
 
-`kv_sync()` forces everything written so far to disk, `kv_backup()` writes a consistent copy of the store to another directory while it keeps running, and `kv_get_stats()` reports keys, live and dead bytes, fsync count and index memory. One `kv_t` can be shared by any number of threads.
+`kv_sync()` forces everything written so far to disk, `kv_scan()` calls a function for every key, `kv_backup()` writes a consistent copy of the store to another directory while it keeps running, `kv_scrub()` reads the store back to look for damage, and `kv_get_stats()` reports keys, live and dead bytes, fsync count, index memory and what scrubbing found. One `kv_t` can be shared by any number of threads.
+
+To try it by hand, `build/release/kvcli ./data` opens a shell on a store (see [kvcli](#kvcli)).
 
 ## How it works
 
@@ -106,6 +108,12 @@ Keys are hashed with SipHash-1-3 under a random per-process key. A plain hash li
 ### Reads
 
 A get takes the read lock, looks up the key, and reads the whole record with a single `pread`. It then checks the CRC, the key and the size before returning the value, so a damaged record is reported as `KV_ERR_CORRUPT` and is never returned as data.
+
+### Scans
+
+`kv_scan()` calls a function for every key, in hash order, while reads and writes go on. It copies keys out of the index under the read lock, 512 keys or 1 MiB at a time, and calls the function with no lock held, so the function can use the store itself. `kv_scan_from()` takes a cursor instead, for a caller like the server that answers one batch per request and keeps nothing between them. A full scan of 1M keys takes 17 ms.
+
+The walk goes over the index's entries, not its probe table. Deleting a key pulls later slots of its probe run backwards, and growing the table reshuffles all of them, so a cursor into the table can skip a key that was there all along, or return one twice. Entries never move, and a key keeps its entry for as long as it exists, so every key that exists for the whole scan is visited exactly once. A key added or deleted during the scan may or may not be, and one deleted and added again can be visited twice.
 
 ### Writes and durability
 
@@ -169,6 +177,12 @@ If compaction fails (out of disk, I/O error), the store keeps working. A partly 
 
 One file is always copied: the segment it just sealed. Opening a store appends to its newest log segment, and right after a backup that segment is the newest in both directories, so sharing it would let each store write into the other's file. A test catches exactly that when the file is linked instead. Another takes five backups while a writer and a compactor are running, and checks that each holds exactly the state after some prefix of the writes.
 
+### Scrubbing
+
+Replay checks every record it reads, but a compacted segment loaded from its hint file is not read at open, and any file can be damaged later. `kv_scrub()` reads every sealed segment back and checks every record, at about 780 MiB/s from the page cache. It holds no lock while it reads, because sealed segments never change: each segment's descriptor is duplicated under the read lock, so a compaction can retire the segment meanwhile, and only the verdict is published. `kv_get_stats()` reports the bytes checked and the number of damaged segments, and `kvtool check` says where the damage is.
+
+With `kv_options.background_scrub` set, a thread does this once for every sealed segment, first the ones present at open and then each one as it is sealed. It pauses 10 ms after every MiB, so it reads at most about 100 MiB/s and leaves the disk to the store's users. `kvserver` turns it on. Reads go through the page cache, so a segment written a moment ago is checked as cached, not as the drive holds it.
+
 ### Concurrency
 
 There are three locks, always taken in the order compaction mutex, writer mutex, store lock:
@@ -184,19 +198,20 @@ Two problems shaped this design, both found by tests:
 
 ## Testing
 
-`make test` runs nine suites in about 20 seconds. They are also run under AddressSanitizer + UBSan (`make test-asan`) and ThreadSanitizer (`make test-tsan`), and `make coverage` reports how much of `src/` they execute: 92% of `kv.c`, 88% of compaction and recovery, 93% of the index, all of the record format and CRC code. Most of what is left is handling of failed memory allocations.
+`make test` runs ten suites in about 20 seconds. They are also run under AddressSanitizer + UBSan (`make test-asan`) and ThreadSanitizer (`make test-tsan`), and `make coverage` reports how much of `src/` they execute: 94% of `kv.c`, 88% of compaction, 87% of recovery, 93% of the index, 85% of scrubbing, all of the record format and CRC code. Most of what is left is handling of failed memory allocations.
 
 | suite | what it does |
 |---|---|
-| `test_kv` | 32 functional tests: every operation, tombstones across restarts, segment rollover, compaction (including records larger than its read chunk, and refusing corrupt ones), hint files (and proof that startup really uses them), crash states inside compaction, backups, directory locking across processes, stats, background compaction, CRC-32 and SipHash reference vectors |
+| `test_kv` | 35 functional tests: every operation, tombstones across restarts, segment rollover, compaction (including records larger than its read chunk, and refusing corrupt ones), hint files (and proof that startup really uses them), crash states inside compaction, backups, scans (including one whose callback writes to the store), scrubbing a segment damaged behind a hint file, directory locking across processes, stats, background compaction, CRC-32 and SipHash reference vectors |
 | `test_model` | 24 random runs of 4,000 operations each against an in-memory model: puts, deletes, gets, compactions, reopens, and about 1,000 simulated crashes (the directory is copied while the store is open and the copy recovered) |
 | `test_crash` | 1,000 random truncations, bit flips and torn tails across log and compacted segments, plus 250 damaged hint files and MANIFESTs. The expected state comes from an independent parser of the record format above, and the damaged segment must end exactly at the last good record. |
 | `test_kill` | 100 SIGKILLs at random moments, including mid-compaction, all on one directory. Every acknowledged put (about 160,000 per run) must survive with its exact value. |
 | `test_faults` | A full disk (via `RLIMIT_FSIZE`) during writes and halfway through a compaction. The torn record must be rolled back, everything acknowledged must stay readable, and a later compaction must succeed. |
 | `test_powerfail` | Power-failure simulation, described below. About 15,600 crash images per run. |
 | `test_fsyncfail` | fsync starts failing with EIO after N calls (an `LD_PRELOAD` shim), for every N from 0 to 80: while opening, on group commits, at segment rollover and inside compaction, with one and four writers. The store must refuse further writes, keep serving reads, release every waiting writer, and lose no acknowledged write once reopened. |
-| `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause; backups taken mid-write and mid-compaction |
-| `test_server` | The protocol, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 24 MB of replies to one pipelined burst, 8 concurrent clients, the connection limit, idle timeouts, shutdown with clients connected |
+| `test_concurrency` | Readers, a writer and a compactor at once, checking values never go backwards; 35,000 puts and gets completing during one compaction; 8 fsync-always writers sharing group commits; background compaction keeping up with 4 writers that never pause; backups taken mid-write and mid-compaction; hundreds of scans that must each see every untouched key exactly once while other keys are deleted and re-added, the index grows past 120,000 keys and compaction runs |
+| `test_server` | The protocol, including `SCAN` walking 1,000 keys three at a time, and the TCP server end to end: pipelining, requests split across writes, oversized lines, 24 MB of replies to one pipelined burst, 8 concurrent clients, the connection limit, idle timeouts, shutdown with clients connected |
+| `test_cli` | The `kvcli` binary, on a store and against a server, which must answer the same script with the same output; `KEYS` over several `SCAN` batches; a directory another process holds |
 
 **Power-failure checker.** A SIGKILL test keeps the page cache, so it cannot tell whether the right fsyncs happen. `tests/pf_shim.c` is loaded with `LD_PRELOAD` and records every create, write, truncate, fsync, rename and unlink the unmodified library makes in the store directory. `test_powerfail` replays that log through a model of a POSIX filesystem and, at every point in it, builds four images of what the disk could hold after a power cut:
 
@@ -215,7 +230,7 @@ To check that this catches anything, I removed each fsync the store depends on, 
 
 **Fuzzing.** Three libFuzzer targets run with ASan and UBSan: arbitrary request lines into the protocol handler; arbitrary directory contents into recovery, where any state recovery decides on must survive compaction and reopening unchanged; and random operation sequences, including crashes, against a model. Five minutes each ran 1.6 million, 105,000 and 26,000 inputs without a failure, and CI fuzzes each target for a minute on every push.
 
-**Testing the tests.** `test_crash` and `test_model` were checked against deliberately broken builds: CRC checks disabled, truncation skipped, tombstones never written, compaction keeping stale versions. The first version of `test_crash` missed the skipped truncation, because new appends happened to overwrite the garbage. It now checks the exact length of every recovered segment.
+**Testing the tests.** `test_crash` and `test_model` were checked against deliberately broken builds: CRC checks disabled, truncation skipped, tombstones never written, compaction keeping stale versions. The first version of `test_crash` missed the skipped truncation, because new appends happened to overwrite the garbage. It now checks the exact length of every recovered segment. The concurrent scan test was checked the same way: a scan that walks the probe table instead of the entries fails it within a hundred scans, with a key seen twice.
 
 ### Bugs found along the way
 
@@ -239,7 +254,7 @@ Measured with `make bench` (source in [`bench/bench.c`](bench/bench.c)).
 
 - **Machine:** an Intel Core i3-4005U laptop (2 cores, 4 threads, 1.7 GHz, from 2013) with 8 GB of RAM and a Crucial BX500 240 GB SATA SSD (DRAM-less), btrfs, Linux 7.2.
 - **Setup:** keys are 16 bytes and values 100 bytes unless noted.
-- **Method:** a desktop session with a busy browser shared the four hardware threads. To filter out its interference, the throughput, group-commit, startup and reader-scaling numbers are the best of three runs; the compaction-latency table is the run with the lowest get p99.9; the table of reads next to a busy writer is the run where the writer got the most done. The rest are single runs of many samples. Between runs, tails and fsync-bound numbers still move by 20 to 50 percent; medians and throughput without fsync move much less.
+- **Method:** a desktop session with a busy browser shared the four hardware threads. To filter out its interference, the throughput, group-commit, startup, reader-scaling, scan and scrub numbers are the best of three runs; the compaction-latency table is the run with the lowest get p99.9; the table of reads next to a busy writer is the run where the writer got the most done. The rest are single runs of many samples. Between runs, tails and fsync-bound numbers still move by 20 to 50 percent; medians and throughput without fsync move much less.
 
 ### Index memory (1000k keys of 16 bytes)
 
@@ -302,6 +317,15 @@ Each get is one `pread`, which here has to go to the SSD. The median is that dri
 
 Compaction took 0.81 s (162 MiB/s of input), leaving 11.9% of the original size (the rest is hint files).
 
+### Scan and scrub (1000k keys, 100 B values, page cache warm)
+
+| operation | covers | time | rate |
+|---|---:|---:|---:|
+| `kv_scan`, every key | 1000000 keys | 16.7 ms | 59.8M keys/s |
+| `kv_scrub`, every sealed segment | 129.7 MiB | 164.3 ms | 790 MiB/s |
+
+The scan's callback only counts keys. Scrubbing is bound by the CRC; the background scrubber is held to about 100 MiB/s.
+
 ### Startup time (rebuilding the index of 1000k keys, 1000 B values)
 
 | index source | page cache | open time |
@@ -357,7 +381,11 @@ GET
 ERR wrong number of arguments for 'GET'
 ```
 
-The value is everything after the single space that follows the key, so it can contain spaces. Keys and values cannot contain a carriage return, which would be indistinguishable from a CRLF line ending. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection. Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address, `-c` the fraction of garbage that triggers background compaction (default 0.5, `-c 0` turns it off), `-m` the most clients served at once (default 1024; each gets a thread, and connections beyond that are answered `ERR too many connections` and closed), and `-t` how many seconds a client may sit idle, sending nothing or not reading its replies, before it is disconnected (default 300). SIGINT or SIGTERM closes the store cleanly. In a 6-second soak of 2 KB overwrites, the server took 627,000 puts (about 1.3 GB), compacted 9 times along the way, and ended with 59 MB on disk.
+The value is everything after the single space that follows the key, so it can contain spaces. Keys and values cannot contain a carriage return, which would be indistinguishable from a CRLF line ending. Commands are case-insensitive, requests can be pipelined, and lines over 1 MiB get `ERR line too long` without dropping the connection.
+
+The server also answers `SCAN <cursor> [count]`, `STATS`, `COMPACT`, `SYNC`, `SCRUB` and `PING`, and every request still gets exactly one reply line. `SCAN` replies `KEYS <next-cursor> <omitted> <key>...` with up to 100 keys (or `count`), fewer once the reply passes 64 KiB, and the cursor to send next, which is 0 once every key has been listed. The server keeps no state between the calls. `<omitted>` counts keys that cannot be written as a token, empty or holding whitespace or a line break, which only a program using the library can store. `STATS` replies `STATS keys=1 segments=2 ...`, one `name=value` pair per field of `kv_stats`.
+
+Options: `-s always|batch|none` sets the fsync policy, `-n` the batch size, `-H` the listen address, `-c` the fraction of garbage that triggers background compaction (default 0.5, `-c 0` turns it off), `-m` the most clients served at once (default 1024; each gets a thread, and connections beyond that are answered `ERR too many connections` and closed), and `-t` how many seconds a client may sit idle, sending nothing or not reading its replies, before it is disconnected (default 300). Background scrubbing is on. SIGINT or SIGTERM closes the store cleanly. In a 6-second soak of 2 KB overwrites, the server took 627,000 puts (about 1.3 GB), compacted 9 times along the way, and ended with 59 MB on disk.
 
 Throughput, measured with [`bench/loadgen.c`](bench/loadgen.c) on the laptop described under [Benchmarks](#benchmarks). Client and server share its four hardware threads, the store uses the default fsync policy (every 100 writes), values are 100 bytes, and each row is the best of three 4-second runs:
 
@@ -370,6 +398,35 @@ Throughput, measured with [`bench/loadgen.c`](bench/loadgen.c) on the laptop des
 | 8 | 32 | all SET | 63,400 | 2.3 ms |
 
 Mixed pipelines sometimes stall for around 100 ms. A write can wait for an fsync of the same file in progress, and this SSD's fsyncs occasionally take that long; every client with a SET in its batch then waits too.
+
+## kvcli
+
+`kvcli` is a shell for a store. `kvcli DIR` opens the directory itself, and `kvcli -h HOST -p PORT` talks to a running `kvserver`. Either way each line goes through the server's protocol handler, so the two modes answer alike, and `kvcli` prints the replies in a form that is easier to read:
+
+```
+$ build/release/kvcli ./data
+./data> SET user:1 alice smith
+OK
+./data> GET user:1
+"alice smith"
+./data> DEL user:2
+(not found)
+./data> KEYS user:*
+1) "user:1"
+(1 key)
+./data> STATS
+keys             1
+segments         1
+disk_bytes       37
+live_bytes       37
+...
+./data> BACKUP ./data-backup
+OK
+./data> FLY me to the moon
+(error) unknown command 'FLY'
+```
+
+On top of the protocol it has `KEYS [pattern]`, a loop over `SCAN` with glob matching, and `BACKUP DIR`, which needs the store itself and is refused over the network. A directory that a server already has open cannot be opened a second time, and `kvcli` says so and suggests connecting to the server instead. Input is read a plain line at a time, without readline, and the prompt appears only on a terminal, so a script can pipe commands in. `kvcli DIR GET user:1` runs a single command. The exit status is 1 if any command failed, and 2 if the store could not be opened or reached.
 
 ## kvtool
 
@@ -407,16 +464,16 @@ $ build/release/kvtool check ./data
 
 - **The index must fit in RAM**: 66 bytes per key, plus the key itself for keys over 16 bytes. A billion keys would need about 66 GB.
 - **One writer at a time.** Appends are serialized; group commit only shares the fsyncs.
-- **No range queries or ordered iteration.** The index is a hash table.
+- **No range queries or ordered iteration.** The index is a hash table, and `kv_scan()` visits keys in hash order.
 - **Values are read whole.** A get allocates and returns the entire value; values are limited to 256 MiB and keys to 64 KiB.
 - **Compaction rewrites everything sealed**, not just the dirtiest segments, and needs free space for a copy of the live data.
 - **Durability is only as good as the drive.** A drive that acknowledges flushes it has not done defeats any fsync policy.
-- **Hint-loaded segments are checksummed lazily.** Damage inside them is not noticed at startup; it shows up as `KV_ERR_CORRUPT` on the affected gets, and compaction stops rather than copy it.
+- **Hint-loaded segments are not checksummed at startup.** Damage inside them shows up as `KV_ERR_CORRUPT` on the affected gets until a scrub reaches it: `kv_scrub()`, or the background scrubber at about 100 MiB/s. Compaction stops rather than copy it.
 - **Locking is local.** The `fcntl` lock is advisory and not meant for network filesystems.
-- **The server is minimal**: no authentication or TLS, keys and values cannot contain line breaks, and it runs a thread per connection, so the number of clients is capped (`-m`, 1024 by default).
+- **The server is minimal**: no authentication or TLS, keys cannot contain whitespace and values cannot contain line breaks, and it runs a thread per connection, so the number of clients is capped (`-m`, 1024 by default).
 - **The power-failure checker is Linux-only** and assumes 512-byte sectors are written atomically.
 
-Several of these are on the [roadmap](ROADMAP.md), along with an interactive shell.
+Several of these are on the [roadmap](ROADMAP.md).
 
 ## Layout
 
@@ -426,11 +483,13 @@ src/kv.c            open/close, writes and group commit, reads, stats
 src/recovery.c      MANIFEST, directory scan, replay, hint loading
 src/compact.c       concurrent compaction
 src/backup.c        online backups with hard links
+src/scrub.c         reading sealed segments back to find damage
 src/index.c         hash index (SipHash-1-3, chunked entries)
 src/record.h/.c     record and hint encoding
 src/crc32.c         slice-by-8 CRC-32
 src/io.c            pread/pwrite loops, fsync, buffered reader and writer
 src/server.c        TCP server and protocol
+tools/kvcli.c       interactive shell, local or over TCP
 tools/kvtool.c      offline checker and dump
 tests/              the suites above, plus the LD_PRELOAD recorder and fault injector
 fuzz/               libFuzzer targets

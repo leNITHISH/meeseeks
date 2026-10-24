@@ -2,19 +2,7 @@
 
 Version 1.0 does what the project set out to do: a Bitcask-style store that survives crashes, with the tests to show it. This is the work planned after it, roughly in the order I expect to do it. Each item has to clear the same bar as the rest of the store. If it touches what is on disk, the power-failure checker has to cover it before it ships.
 
-## Interactive shell (`kvcli`)
-
-A prompt in the style of `redis-cli` or `sqlite3`: type `GET`, `SET` and `DEL`, plus `COMPACT`, `SYNC`, `STATS` and `BACKUP`, and see the result. Right now the only ways to poke at a store are writing a C program or typing raw protocol into `nc`.
-
-It would have two modes. `kvcli ./data` links the library and opens the directory directly. `kvcli -h host -p port` talks to a running `kvserver`. Local mode cannot open a directory a server already has open, because the directory lock keeps a second handle out, so the shell should say so plainly instead of reporting a bare `KV_ERR_LOCKED`. Input is read a plain line at a time, without readline, to keep the store free of dependencies.
-
-`KEYS` and `SCAN` in the shell depend on the next item.
-
-## Key iteration
-
-There is no way to list the keys in a store. The index knows all of them, but the API only answers questions about one key at a time. A `kv_scan(db, callback, ctx)` or an iterator object would fix that, and it would also give the server and the shell a `KEYS` command and make a logical export possible (dump every key and value, load them into a fresh store).
-
-The open question is what a scan promises while writes continue. Copying the index under the read lock gives a true snapshot but costs memory proportional to the store, and at 1M keys the index is 62 MiB. Walking it in chunks, dropping the lock between them as compaction already does, costs nothing up front, but a key written during the scan may or may not appear. The chunked walk is probably the right default, documented honestly, with an export built on top of a `kv_backup()` taken first.
+Done since 1.0: the interactive shell (`kvcli`), key iteration (`kv_scan()` and the server's `SCAN`), and scrubbing (`kv_scrub()` and a background scrubber). None of them changed the on-disk format.
 
 ## Atomic batches
 
@@ -33,10 +21,6 @@ Two parts of the current design assume a full compaction:
 
 The store would also need to count live bytes per segment. It counts them only for the whole store now.
 
-## Background scrub
-
-A segment loaded from its hint file is not checksummed at startup, so damage inside it goes unnoticed until a get reads the bad record. `kvtool check` already finds such damage, but only offline. A low-priority background thread that reads each sealed segment once, checks every record and reports the result in `kv_get_stats()` would find damage before a client hits it, while there is still a backup to restore from.
-
 ## Server protocol
 
 The text protocol cannot carry line breaks in keys or values, and every client needs its own thread. Two changes would fix that:
@@ -46,5 +30,6 @@ The text protocol cannot carry line breaks in keys or values, and every client n
 
 ## Smaller ideas
 
+- A logical export and import, every key and value, for moving data between versions of the format. It would be built on `kv_scan()` and run against a `kv_backup()` taken first, so that it sees one consistent state while the store keeps running.
 - Streaming or ranged reads, so a large value does not have to be read and allocated whole.
 - Optional per-record compression for large values.
