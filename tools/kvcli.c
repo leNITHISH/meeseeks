@@ -5,7 +5,7 @@
  *   kvcli -h HOST -p PORT [command...]   talk to a running kvserver
  *
  * Commands are those of the server protocol (GET, SET, DEL, SCAN, STATS,
- * COMPACT, SYNC, PING), plus KEYS [pattern], BACKUP DIR (local stores
+ * COMPACT, SYNC, SCRUB, PING), plus KEYS [pattern], BACKUP DIR (local stores
  * only), HELP and QUIT. A local store answers through the same protocol
  * handler as the server, so both modes reply alike. Given a command on the
  * command line, kvcli runs just that one; otherwise it reads commands from
@@ -319,6 +319,7 @@ static void help(void)
          "STATS                counters and sizes\n"
          "COMPACT              reclaim the space of old and deleted records\n"
          "SYNC                 make every write so far durable\n"
+         "SCRUB                read every sealed segment back and check it\n"
          "BACKUP dir           copy the store to a new directory (local only)\n"
          "PING                 check that the store answers\n"
          "QUIT                 leave");

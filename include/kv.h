@@ -35,6 +35,10 @@ typedef struct {
      * segment bytes (and at least one segment's worth), compact in a
      * background thread. 0 disables it. */
     double auto_compact_ratio;
+    /* Background scrub: a low-priority thread reads every sealed segment
+     * back once, the ones present at open first, and checks every record.
+     * Damage shows up in kv_stats.damaged_segments. */
+    int background_scrub;
 } kv_options;
 
 /* Return codes. Negative values are errors. */
@@ -64,10 +68,12 @@ typedef struct {
     uint64_t syncs;       /* fsyncs issued for writes (one per group commit) */
     uint64_t compactions; /* since open */
     uint64_t index_bytes; /* memory held by the in-memory index */
+    uint64_t scrub_bytes; /* segment bytes read back and checked since open */
+    uint64_t damaged_segments; /* segments a scrub found damaged */
 } kv_stats;
 
 /* Fill opts with defaults: KV_SYNC_EVERY_N (n=100), 64 MiB segments, hints on,
- * no background compaction. */
+ * no background compaction or scrub. */
 void kv_default_options(kv_options *opts);
 
 /* Open (creating if needed) the store in directory `path`. opts may be NULL. */
@@ -110,6 +116,17 @@ int kv_compact(kv_t *db);
 
 /* Make every write so far durable. */
 int kv_sync(kv_t *db);
+
+/*
+ * Read every sealed segment back and check every record, to find damage
+ * before a get runs into it: a segment loaded from its hint file at open is
+ * not checksummed until then. Reads and writes go on meanwhile. Returns
+ * KV_OK if every segment is intact, KV_ERR_CORRUPT if any is damaged (see
+ * kv_stats.damaged_segments; `kvtool check` says where), or KV_ERR_IO.
+ * Reads go through the page cache, so recently written data is checked as
+ * cached.
+ */
+int kv_scrub(kv_t *db);
 
 /* Write a consistent copy of the store, as of this call, to the directory
  * `path`, which must not exist yet. Files are hard-linked where possible, so

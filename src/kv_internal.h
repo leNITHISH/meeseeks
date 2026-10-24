@@ -1,4 +1,4 @@
-/* Internals shared by kv.c, recovery.c and compact.c. */
+/* Internals shared by kv.c, recovery.c, compact.c, backup.c and scrub.c. */
 #ifndef KV_INTERNAL_H
 #define KV_INTERNAL_H
 
@@ -29,7 +29,9 @@
 #define SEG_NAME_MAX 40
 
 enum {
-    SEG_TMP = 1 /* compaction output still under its .tmp name */
+    SEG_TMP = 1,      /* compaction output still under its .tmp name */
+    SEG_SCRUBBED = 2, /* a scrub read it back and every record checked out */
+    SEG_DAMAGED = 4   /* a scrub found a record that does not */
 };
 
 typedef struct {
@@ -107,6 +109,15 @@ struct kv {
     pthread_mutex_t bg_mu;
     pthread_cond_t bg_cv;
     int bg_stop, bg_kick;
+
+    /* Background scrub thread (opts.background_scrub), woken through
+     * scrub_cv when a segment is sealed. scrub_kick is guarded by bg_mu,
+     * scrub_bytes by `lock`. */
+    pthread_t scrub_thread;
+    int scrub_running;
+    pthread_cond_t scrub_cv;
+    int scrub_kick;
+    uint64_t scrub_bytes;
 };
 
 /* ---------- locking ---------- */
@@ -171,6 +182,14 @@ void kv_set_failed(kv_t *db);
 
 /* Wake the background compactor if garbage passed the threshold. */
 void kv_maybe_kick_compactor(kv_t *db);
+
+/* ---------- scrubbing (scrub.c) ---------- */
+
+/* Wake the background scrubber, if there is one: a segment was sealed. */
+void kv_kick_scrubber(kv_t *db);
+
+/* The background scrubber's thread. */
+void *scrub_main(void *arg);
 
 /* ---------- recovery (recovery.c) ---------- */
 

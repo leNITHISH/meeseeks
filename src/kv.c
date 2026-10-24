@@ -130,8 +130,10 @@ int seg_rollover(kv_t *db)
         return rc;
     kv_write_lock(db);
     rc = seg_insert(db, &s) == 0 ? KV_OK : KV_ERR_NOMEM;
-    if (rc == KV_OK)
+    if (rc == KV_OK) {
         kv_maybe_kick_compactor(db);
+        kv_kick_scrubber(db); /* the old active segment is sealed now */
+    }
     kv_unlock(db);
     if (rc != KV_OK) {
         char name[SEG_NAME_MAX];
@@ -288,6 +290,26 @@ static void *bg_main(void *arg)
     return NULL;
 }
 
+/* Stop and join the background threads; both give up their current work
+ * once `closing` is set. */
+static void stop_background(kv_t *db)
+{
+    atomic_store(&db->closing, 1);
+    pthread_mutex_lock(&db->bg_mu);
+    db->bg_stop = 1;
+    pthread_cond_signal(&db->bg_cv);
+    pthread_cond_signal(&db->scrub_cv);
+    pthread_mutex_unlock(&db->bg_mu);
+    if (db->bg_running) {
+        pthread_join(db->bg_thread, NULL);
+        db->bg_running = 0;
+    }
+    if (db->scrub_running) {
+        pthread_join(db->scrub_thread, NULL);
+        db->scrub_running = 0;
+    }
+}
+
 /* ---------- open / close ---------- */
 
 void kv_default_options(kv_options *o)
@@ -297,6 +319,7 @@ void kv_default_options(kv_options *o)
     o->segment_size = KV_DEFAULT_SEGMENT_SIZE;
     o->use_hints = 1;
     o->auto_compact_ratio = 0;
+    o->background_scrub = 0;
 }
 
 static void free_db(kv_t *db)
@@ -309,6 +332,7 @@ static void free_db(kv_t *db)
     unlock_dir(db);
     if (db->dirfd >= 0)
         close(db->dirfd);
+    pthread_cond_destroy(&db->scrub_cv);
     pthread_cond_destroy(&db->bg_cv);
     pthread_mutex_destroy(&db->bg_mu);
     pthread_mutex_destroy(&db->compact_mu);
@@ -332,6 +356,7 @@ static int init_sync(kv_t *db)
     bad |= pthread_mutex_init(&db->compact_mu, NULL);
     bad |= pthread_mutex_init(&db->bg_mu, NULL);
     bad |= pthread_cond_init(&db->bg_cv, NULL);
+    bad |= pthread_cond_init(&db->scrub_cv, NULL);
     return bad ? -1 : 0;
 }
 
@@ -390,7 +415,15 @@ int kv_open(const char *path, const kv_options *opts, kv_t **out)
         else
             rc = KV_ERR_NOMEM;
     }
+    if (rc == KV_OK && db->opts.background_scrub) {
+        db->scrub_kick = 1; /* start with the segments that are here */
+        if (pthread_create(&db->scrub_thread, NULL, scrub_main, db) == 0)
+            db->scrub_running = 1;
+        else
+            rc = KV_ERR_NOMEM;
+    }
     if (rc != KV_OK) {
+        stop_background(db);
         free_db(db);
         return rc;
     }
@@ -402,15 +435,7 @@ int kv_close(kv_t *db)
 {
     if (!db)
         return KV_ERR_INVALID;
-    atomic_store(&db->closing, 1);
-    if (db->bg_running) {
-        pthread_mutex_lock(&db->bg_mu);
-        db->bg_stop = 1;
-        pthread_cond_signal(&db->bg_cv);
-        pthread_mutex_unlock(&db->bg_mu);
-        pthread_join(db->bg_thread, NULL);
-        db->bg_running = 0;
-    }
+    stop_background(db);
     int rc = KV_OK;
     if (atomic_load(&db->failed))
         rc = KV_ERR_FAILED;
@@ -822,8 +847,10 @@ void kv_get_stats(kv_t *db, kv_stats *st)
     memset(st, 0, sizeof *st);
     kv_read_lock(db);
     uint64_t seg_bytes = 0;
-    for (size_t i = 0; i < db->nsegs; i++)
+    for (size_t i = 0; i < db->nsegs; i++) {
         seg_bytes += db->segs[i].size;
+        st->damaged_segments += (db->segs[i].flags & SEG_DAMAGED) != 0;
+    }
     st->keys = db->idx.count;
     st->segments = db->nsegs;
     st->disk_bytes = kv_disk_bytes_locked(db);
@@ -833,6 +860,7 @@ void kv_get_stats(kv_t *db, kv_stats *st)
     st->deletes = db->ndeletes;
     st->compactions = db->ncompactions;
     st->index_bytes = index_memory(&db->idx);
+    st->scrub_bytes = db->scrub_bytes;
     kv_unlock(db);
     pthread_mutex_lock(&db->sync_mu);
     st->syncs = db->nsyncs;

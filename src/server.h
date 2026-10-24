@@ -14,7 +14,7 @@
  *   DEL <key>             -> OK             |  NOT_FOUND
  *   SCAN <cursor> [count] -> KEYS <next-cursor> <omitted> <key>...
  *   STATS                 -> STATS keys=<n> segments=<n> ...
- *   COMPACT, SYNC         -> OK
+ *   COMPACT, SYNC, SCRUB  -> OK
  *   PING                  -> PONG
  *   anything malformed    -> ERR <reason>
  *

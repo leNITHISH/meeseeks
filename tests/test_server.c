@@ -103,8 +103,11 @@ static void test_admin_commands(const char *dir)
     request(db, "STATS", line, sizeof line);
     CHECK(strncmp(line, "STATS keys=1 segments=", 22) == 0);
     CHECK(strstr(line, " puts=2 deletes=1 ") && strstr(line, " compactions=1 "));
-    CHECK(strstr(line, " index_bytes="));
+    CHECK(strstr(line, " index_bytes=") && strstr(line, " damaged_segments=0"));
     exchange(db, "STATS now", "ERR wrong number of arguments for 'STATS'\n");
+    exchange(db, "SCRUB", "OK\n");
+    request(db, "STATS", line, sizeof line);
+    CHECK(!strstr(line, " scrub_bytes=0 ")); /* the compacted segment */
 
     exchange(db, "SCAN", "ERR wrong number of arguments for 'SCAN'\n");
     exchange(db, "SCAN 0 1 2", "ERR wrong number of arguments for 'SCAN'\n");

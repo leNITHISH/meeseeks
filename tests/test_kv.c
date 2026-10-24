@@ -1164,6 +1164,92 @@ static void test_scan(const char *dir)
     CHECK_RC(kv_close(db), KV_OK);
 }
 
+/* ---------- scrubbing ---------- */
+
+/* Flip a byte in the value of the last record of the compacted segment
+ * build_compacted() left behind. Returns the segment's size. */
+static off_t damage_compacted(const char *dir)
+{
+    char seg[64], p[512];
+    first_file(dir, ".seg", seg);
+    snprintf(p, sizeof p, "%s/%s", dir, seg);
+    off_t size = tu_file_size(p);
+    int fd = open(p, O_RDWR);
+    CHECK(fd >= 0);
+    uint8_t b;
+    CHECK(pread(fd, &b, 1, size - 3) == 1);
+    b ^= 0x5A;
+    CHECK(pwrite(fd, &b, 1, size - 3) == 1);
+    close(fd);
+    return size;
+}
+
+/* A segment loaded from its hint is not checksummed at open: the damage is
+ * invisible until a get reads that record, or a scrub reads them all. */
+static void test_scrub(const char *dir)
+{
+    kv_options o = small_opts(1 << 20);
+    build_compacted(dir, &o);
+    kv_t *db = open_db(dir, &o);
+    kv_stats st;
+    CHECK_RC(kv_scrub(db), KV_OK);
+    kv_get_stats(db, &st);
+    CHECK(st.damaged_segments == 0 && st.scrub_bytes > 0);
+    CHECK_RC(kv_close(db), KV_OK);
+    CHECK_RC(kv_scrub(NULL), KV_ERR_INVALID);
+
+    off_t size = damage_compacted(dir);
+    db = open_db(dir, &o);
+    kv_get_stats(db, &st);
+    CHECK(st.keys == 500 && st.damaged_segments == 0); /* not noticed */
+    CHECK_RC(kv_scrub(db), KV_ERR_CORRUPT);
+    kv_get_stats(db, &st);
+    CHECK(st.damaged_segments == 1);
+    /* it read up to the bad record, the last one, and no further */
+    CHECK(st.scrub_bytes < (uint64_t)size && st.scrub_bytes > (uint64_t)size / 2);
+
+    /* The store keeps working, and newly sealed segments are fine. */
+    put_s(db, "after", "the scrub");
+    CHECK_RC(kv_sync(db), KV_OK);
+    expect(db, "after", "the scrub");
+    CHECK_RC(kv_scrub(db), KV_ERR_CORRUPT); /* still damaged */
+    kv_get_stats(db, &st);
+    CHECK(st.damaged_segments == 1);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
+static void test_background_scrub(const char *dir)
+{
+    kv_options o = small_opts(16 * 1024);
+    build_compacted(dir, &o);
+    damage_compacted(dir);
+    o.background_scrub = 1;
+    kv_t *db = open_db(dir, &o);
+    kv_stats st;
+    for (int i = 0; i < 2000; i++) { /* it starts with what is there */
+        kv_get_stats(db, &st);
+        if (st.damaged_segments)
+            break;
+        tu_sleep_us(5000);
+    }
+    CHECK(st.damaged_segments == 1);
+
+    /* Segments sealed after open are read back too: wait for at least
+     * 100 KiB more to be checked. */
+    uint64_t before = st.scrub_bytes;
+    fill_overwrites(db, 500, 4); /* about 300 KiB, many rollovers */
+    for (int i = 0; i < 2000; i++) {
+        kv_get_stats(db, &st);
+        if (st.scrub_bytes >= before + 100 * 1024)
+            break;
+        tu_sleep_us(5000);
+    }
+    CHECK(st.scrub_bytes >= before + 100 * 1024);
+    CHECK(st.damaged_segments == 1);
+    check_final_round(db, 500, 4, 0);
+    CHECK_RC(kv_close(db), KV_OK); /* stops the scrubber */
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -1201,6 +1287,8 @@ int main(void)
         {"backup is isolated from the original",
          test_backup_shares_nothing_writable},
         {"scan", test_scan},
+        {"scrub finds damage open() missed", test_scrub},
+        {"background scrub", test_background_scrub},
     };
     return tu_run("test_kv", tests, sizeof tests / sizeof *tests);
 }

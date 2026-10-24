@@ -519,6 +519,7 @@ int kv_compact(kv_t *db)
         }
         io_fsync_dir(db->dirfd); /* not required: the MANIFEST already
                                     marks them garbage for the next open */
+        kv_kick_scrubber(db);    /* the outputs are sealed segments now */
     }
 
     free(inputs);

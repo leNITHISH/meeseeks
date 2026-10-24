@@ -184,29 +184,33 @@ static int handle_stats(kv_t *db, sbuf *out)
     snprintf(line, sizeof line,
              "STATS keys=%llu segments=%llu disk_bytes=%llu live_bytes=%llu "
              "dead_bytes=%llu puts=%llu deletes=%llu syncs=%llu "
-             "compactions=%llu index_bytes=%llu\n",
+             "compactions=%llu index_bytes=%llu scrub_bytes=%llu "
+             "damaged_segments=%llu\n",
              (unsigned long long)st.keys, (unsigned long long)st.segments,
              (unsigned long long)st.disk_bytes,
              (unsigned long long)st.live_bytes,
              (unsigned long long)st.dead_bytes, (unsigned long long)st.puts,
              (unsigned long long)st.deletes, (unsigned long long)st.syncs,
              (unsigned long long)st.compactions,
-             (unsigned long long)st.index_bytes);
+             (unsigned long long)st.index_bytes,
+             (unsigned long long)st.scrub_bytes,
+             (unsigned long long)st.damaged_segments);
     return sb_puts(out, line);
 }
 
-/* Commands that take no key: PING, STATS, COMPACT, SYNC, SCAN. Returns 1 if
- * cmd is none of them, else what server_handle_line returns. */
+/* Commands that take no key: PING, STATS, COMPACT, SYNC, SCRUB, SCAN.
+ * Returns 1 if cmd is none of them, else what server_handle_line returns. */
 static int handle_keyless(kv_t *db, const char *cmd, size_t cmd_len,
                           const char *args, size_t len, sbuf *out)
 {
-    static const char *const bare[] = {"PING", "STATS", "COMPACT", "SYNC"};
+    static const char *const bare[] = {"PING", "STATS", "COMPACT", "SYNC",
+                                       "SCRUB"};
     if (cmd_is(cmd, cmd_len, "SCAN"))
         return handle_scan(db, args, len, out);
     size_t which = 0;
-    while (which < 4 && !cmd_is(cmd, cmd_len, bare[which]))
+    while (which < 5 && !cmd_is(cmd, cmd_len, bare[which]))
         which++;
-    if (which == 4)
+    if (which == 5)
         return 1;
     for (size_t i = 0; i < len; i++)
         if (!is_sep(args[i]))
@@ -221,8 +225,14 @@ static int handle_keyless(kv_t *db, const char *cmd, size_t cmd_len,
     case 2:
         rc = kv_compact(db);
         break;
-    default:
+    case 3:
         rc = kv_sync(db);
+        break;
+    default:
+        rc = kv_scrub(db);
+        if (rc == KV_ERR_CORRUPT)
+            return reply_err(out, "%s", "damaged segments found (see STATS "
+                                        "and kvtool check)");
         break;
     }
     return rc == KV_OK ? sb_puts(out, "OK\n")
@@ -676,6 +686,7 @@ int main(int argc, char **argv)
     kv_options o;
     kv_default_options(&o);
     o.auto_compact_ratio = 0.5; /* a long-running server must reclaim space */
+    o.background_scrub = 1;     /* and should notice damage before clients do */
     while ((opt = getopt(argc, argv, "d:H:p:s:n:c:m:t:h")) != -1) {
         switch (opt) {
         case 'd':
@@ -751,6 +762,10 @@ int main(int argc, char **argv)
            (unsigned long long)st.puts, (unsigned long long)st.deletes,
            (unsigned long long)st.compactions, (unsigned long long)st.keys,
            (double)st.disk_bytes / (1024.0 * 1024.0));
+    if (st.damaged_segments)
+        printf("kvserver: scrubbing found %llu damaged segments; run kvtool "
+               "check %s\n",
+               (unsigned long long)st.damaged_segments, dir);
     int crc = kv_close(db);
     printf("kvserver: shut down cleanly\n");
     return rc == 0 && crc == KV_OK ? 0 : 1;
