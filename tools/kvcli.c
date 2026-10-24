@@ -581,10 +581,17 @@ static int run_line(cli *c, char *line, size_t len)
     size_t clen = i - cs;
     while (i < len && (line[i] == ' ' || line[i] == '\t'))
         i++;
-    const char *arg = line + i; /* the rest of the line, NUL-terminated */
+    char *arg = line + i; /* the rest of the line, NUL-terminated */
 
     if (clen == 0)
         return 0;
+    /* The shell's own commands take one word and may have trailing blanks;
+     * the rest go to the store untouched, since a value can end in spaces. */
+    int own = word_is(cmd, clen, "KEYS") || word_is(cmd, clen, "EXPORT") ||
+              word_is(cmd, clen, "IMPORT") || word_is(cmd, clen, "BACKUP");
+    for (size_t n = strlen(arg); own && n && (arg[n - 1] == ' ' ||
+                                              arg[n - 1] == '\t');)
+        arg[--n] = '\0';
     if (word_is(cmd, clen, "QUIT") || word_is(cmd, clen, "EXIT"))
         return 2;
     if (word_is(cmd, clen, "HELP")) {
