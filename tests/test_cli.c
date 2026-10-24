@@ -1,7 +1,8 @@
 /*
  * kvcli end to end: runs the kvcli binary built next to this test, on a
  * store directly and against a server running in this process. Both must
- * answer the same script with the same output.
+ * answer the same script with the same output. Also runs the kvserver
+ * binary, to see it report damage that its background scrubber finds.
  */
 #include <pthread.h>
 #include <signal.h>
@@ -10,7 +11,7 @@
 #include "server.h"
 #include "test_util.h"
 
-static char g_kvcli[512];
+static char g_kvcli[512], g_kvserver[512];
 
 static char *slurp(const char *path)
 {
@@ -401,6 +402,73 @@ static void test_export_import(const char *dir)
     free(big);
 }
 
+/* ---------- kvserver ---------- */
+
+static void test_server_reports_damage(const char *dir)
+{
+    /* A compacted store whose hint file hides a damaged value: opening it
+     * does not notice, the background scrubber does. */
+    kv_options o;
+    kv_default_options(&o);
+    o.sync_policy = KV_SYNC_NONE;
+    kv_t *db;
+    CHECK_RC(kv_open(dir, &o, &db), KV_OK);
+    char k[32], v[64];
+    for (int i = 0; i < 500; i++) {
+        snprintf(k, sizeof k, "key-%d", i);
+        snprintf(v, sizeof v, "value-%d-and-some-padding", i);
+        CHECK_RC(kv_put(db, k, strlen(k), v, strlen(v)), KV_OK);
+    }
+    CHECK_RC(kv_compact(db), KV_OK);
+    CHECK_RC(kv_close(db), KV_OK);
+    char seg[300];
+    snprintf(seg, sizeof seg, "%s/0000000001-000001.seg", dir);
+    off_t size = tu_file_size(seg);
+    int fd = open(seg, O_RDWR);
+    uint8_t b;
+    CHECK(fd >= 0 && pread(fd, &b, 1, size - 3) == 1);
+    b ^= 0x5A;
+    CHECK(pwrite(fd, &b, 1, size - 3) == 1);
+    close(fd);
+
+    char out_p[300], err_p[300];
+    snprintf(out_p, sizeof out_p, "%s-srv.out", dir);
+    snprintf(err_p, sizeof err_p, "%s-srv.err", dir);
+    fflush(NULL);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int in = open("/dev/null", O_RDONLY);
+        int out = open(out_p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int err = open(err_p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (in < 0 || out < 0 || err < 0 || dup2(in, 0) < 0 ||
+            dup2(out, 1) < 0 || dup2(err, 2) < 0)
+            _exit(126);
+        execl(g_kvserver, g_kvserver, "-d", dir, "-p", "0", (char *)NULL);
+        _exit(127);
+    }
+    char *err = NULL;
+    int found = 0;
+    for (int i = 0; i < 150 && !found; i++) {
+        tu_sleep_us(100000);
+        free(err);
+        err = slurp(err_p);
+        found = strstr(err, "scrubbing found 1 damaged segment in ") != NULL;
+    }
+    CHECK(found && strstr(err, "; run kvtool check "));
+    CHECK(kill(pid, SIGTERM) == 0); /* handlers are set before scrubbing starts */
+    int st;
+    CHECK(waitpid(pid, &st, 0) == pid);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    char *out = slurp(out_p);
+    CHECK(strstr(out, "listening on 127.0.0.1:") &&
+          strstr(out, "shut down cleanly"));
+    free(out);
+    free(err);
+    unlink(out_p);
+    unlink(err_p);
+}
+
 typedef struct {
     kv_t *db;
     int fd;
@@ -468,6 +536,9 @@ int main(int argc, char **argv)
     snprintf(slash ? slash + 1 : g_kvcli,
              sizeof g_kvcli - (size_t)(slash ? slash + 1 - g_kvcli : 0), "kvcli");
     CHECK(access(g_kvcli, X_OK) == 0);
+    snprintf(g_kvserver, sizeof g_kvserver, "%s", g_kvcli);
+    snprintf(g_kvserver + strlen(g_kvserver) - 5, 9, "kvserver");
+    CHECK(access(g_kvserver, X_OK) == 0);
     signal(SIGPIPE, SIG_IGN);
     static const test_case tests[] = {
         {"local store", test_local},
@@ -475,6 +546,7 @@ int main(int argc, char **argv)
         {"directory open elsewhere", test_locked},
         {"EXPORT and IMPORT round trip", test_export_import},
         {"remote server, same answers", test_remote},
+        {"kvserver reports damage it finds", test_server_reports_damage},
     };
     return tu_run("test_cli", tests, sizeof tests / sizeof *tests);
 }

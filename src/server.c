@@ -654,6 +654,36 @@ int server_serve(kv_t *db, int listen_fd)
 
 static int g_listen_fd = -1;
 
+/* The background scrubber reports what it finds through kv_get_stats():
+ * say so on stderr as soon as damage shows up, while there may still be a
+ * backup to restore from, not only at shutdown. */
+typedef struct {
+    kv_t *db;
+    const char *dir;
+    atomic_int stop;
+} watcher;
+
+static void *watch_main(void *arg)
+{
+    watcher *w = arg;
+    uint64_t reported = 0;
+    while (!atomic_load(&w->stop)) {
+        kv_stats st;
+        kv_get_stats(w->db, &st);
+        if (st.damaged_segments > reported) {
+            fprintf(stderr,
+                    "kvserver: scrubbing found %llu damaged segment%s in %s; "
+                    "run kvtool check %s\n",
+                    (unsigned long long)st.damaged_segments,
+                    st.damaged_segments == 1 ? "" : "s", w->dir, w->dir);
+            reported = st.damaged_segments;
+        }
+        struct timespec ts = {0, 200 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
 static void on_signal(int sig)
 {
     (void)sig;
@@ -780,8 +810,15 @@ int main(int argc, char **argv)
     printf("kvserver: %zu keys in %s, listening on %s:%d\n", kv_count(db), dir,
            host, bound);
     fflush(stdout);
+    watcher w = {.db = db, .dir = dir};
+    pthread_t wt;
+    int watching = pthread_create(&wt, NULL, watch_main, &w) == 0;
     rc = server_serve(db, g_listen_fd);
     close(g_listen_fd);
+    if (watching) {
+        atomic_store(&w.stop, 1);
+        pthread_join(wt, NULL);
+    }
     kv_stats st;
     kv_get_stats(db, &st);
     printf("kvserver: %llu puts, %llu deletes, %llu compactions; %llu keys, "
@@ -789,10 +826,6 @@ int main(int argc, char **argv)
            (unsigned long long)st.puts, (unsigned long long)st.deletes,
            (unsigned long long)st.compactions, (unsigned long long)st.keys,
            (double)st.disk_bytes / (1024.0 * 1024.0));
-    if (st.damaged_segments)
-        printf("kvserver: scrubbing found %llu damaged segments; run kvtool "
-               "check %s\n",
-               (unsigned long long)st.damaged_segments, dir);
     int crc = kv_close(db);
     printf("kvserver: shut down cleanly\n");
     return rc == 0 && crc == KV_OK ? 0 : 1;

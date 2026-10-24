@@ -89,8 +89,8 @@ $(SERVER): src/server.c $(LIB)
 $(B)/test_server: tests/test_server.c src/server.c tests/test_util.h $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_server.c src/server.c $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
-# test_cli runs the kvcli binary next to it, against a store and a server
-$(B)/test_cli: tests/test_cli.c src/server.c tests/test_util.h $(LIB) $(KVCLI)
+# test_cli runs the kvcli and kvserver binaries next to it
+$(B)/test_cli: tests/test_cli.c src/server.c tests/test_util.h $(LIB) $(KVCLI) $(SERVER)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/test_cli.c src/server.c $(LIB) $(LDFLAGS) $(LDLIBS) -o $@
 
 # The power-failure recorder is never instrumented: sanitizer runtimes must
