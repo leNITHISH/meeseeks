@@ -27,7 +27,7 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 - [Testing](#testing) and the bugs it found
 - [Benchmarks](#benchmarks)
 - [TCP server](#tcp-server) and [kvtool](#kvtool)
-- [Known limitations](#known-limitations)
+- [Known limitations](#known-limitations) and the [roadmap](ROADMAP.md)
 
 ## Quick start
 
@@ -415,6 +415,8 @@ $ build/release/kvtool check ./data
 - **Locking is local.** The `fcntl` lock is advisory and not meant for network filesystems.
 - **The server is minimal**: no authentication or TLS, keys and values cannot contain line breaks, and it runs a thread per connection, so the number of clients is capped (`-m`, 1024 by default).
 - **The power-failure checker is Linux-only** and assumes 512-byte sectors are written atomically.
+
+Several of these are on the [roadmap](ROADMAP.md), along with an interactive shell.
 
 ## Layout
 
