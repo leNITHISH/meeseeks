@@ -3,7 +3,8 @@
  *
  * Drives the store with a long random sequence of puts, deletes, gets,
  * compactions, clean reopens and simulated crashes, and checks it against a
- * trivial in-memory model after every step. A "crash" copies the directory
+ * trivial in-memory model after every step. Whole-store checks also require
+ * a scan to list exactly the live keys and a scrub to find nothing. A "crash" copies the directory
  * while the store is still open (so nothing from kv_close() runs), opens the
  * copy and requires it to match the model exactly: at every operation
  * boundary the files on disk must already describe a consistent store.
@@ -72,6 +73,40 @@ static void check_key(kv_t *db, const model *m, int i, const char *ctx)
     }
 }
 
+typedef struct {
+    const model *m;
+    int seen[MAX_KEYS];
+    int others;
+} scan_check;
+
+/* Which key_name() is this, or -1 for none. */
+static int key_number(const model *m, const void *key, size_t klen)
+{
+    char buf[64], want[64];
+    if (klen >= sizeof buf)
+        return -1;
+    memcpy(buf, key, klen);
+    buf[klen] = '\0';
+    int i = klen == 0 ? 0 : buf[0] == 'k' ? atoi(buf + 1) : -1;
+    if (i < 0 || i >= m->nkeys)
+        return -1;
+    key_name(i, want, sizeof want);
+    return strlen(want) == klen && memcmp(want, key, klen) == 0 ? i : -1;
+}
+
+static int scan_mark(void *ctx, const void *key, size_t klen)
+{
+    scan_check *c = ctx;
+    int i = key_number(c->m, key, klen);
+    if (i < 0)
+        c->others++;
+    else
+        c->seen[i]++;
+    return 0;
+}
+
+/* Every key, the count, a scan that lists exactly the live keys, and a
+ * scrub that finds nothing wrong. */
 static void check_all(kv_t *db, const model *m, const char *ctx)
 {
     for (int i = 0; i < m->nkeys; i++)
@@ -81,6 +116,18 @@ static void check_all(kv_t *db, const model *m, const char *ctx)
                 m->live);
         exit(1);
     }
+    static scan_check c;
+    memset(&c, 0, sizeof c);
+    c.m = m;
+    CHECK_RC(kv_scan(db, scan_mark, &c), KV_OK);
+    for (int i = 0; i < m->nkeys; i++)
+        if (c.seen[i] != m->s[i].present) {
+            fprintf(stderr, "\n%s: scan saw key %d %d times, want %d\n", ctx,
+                    i, c.seen[i], m->s[i].present);
+            exit(1);
+        }
+    CHECK(c.others == 0);
+    CHECK_RC(kv_scrub(db), KV_OK);
 }
 
 static void run(uint64_t seed, int steps, int *stats)
