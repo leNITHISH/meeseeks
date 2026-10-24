@@ -111,7 +111,7 @@ A get takes the read lock, looks up the key, and reads the whole record with a s
 
 ### Scans
 
-`kv_scan()` calls a function for every key, in hash order, while reads and writes go on. It copies keys out of the index under the read lock, 512 keys or 1 MiB at a time, and calls the function with no lock held, so the function can use the store itself. `kv_scan_from()` takes a cursor instead, for a caller like the server that answers one batch per request and keeps nothing between them. A full scan of 1M keys takes 17 ms.
+`kv_scan()` calls a function for every key, in hash order, while reads and writes go on. It copies keys out of the index under the read lock, at most 512 keys, 1 MiB of keys or 4,096 index entries at a time, and calls the function with no lock held, so the function can use the store itself. `kv_scan_from()` takes a cursor instead, for a caller like the server that answers one batch per request and keeps nothing between them. A full scan of 1M keys takes 17 ms.
 
 The walk goes over the index's entries, not its probe table. Deleting a key pulls later slots of its probe run backwards, and growing the table reshuffles all of them, so a cursor into the table can skip a key that was there all along, or return one twice. Entries never move, and a key keeps its entry for as long as it exists, so every key that exists for the whole scan is visited exactly once. A key added or deleted during the scan may or may not be, and one deleted and added again can be visited twice.
 
@@ -179,7 +179,7 @@ One file is always copied: the segment it just sealed. Opening a store appends t
 
 ### Scrubbing
 
-Replay checks every record it reads, but a compacted segment loaded from its hint file is not read at open, and any file can be damaged later. `kv_scrub()` reads every sealed segment back and checks every record, at about 780 MiB/s from the page cache. It holds no lock while it reads, because sealed segments never change: each segment's descriptor is duplicated under the read lock, so a compaction can retire the segment meanwhile, and only the verdict is published. `kv_get_stats()` reports the bytes checked and the number of damaged segments, and `kvtool check` says where the damage is.
+Replay checks every record it reads, but a compacted segment loaded from its hint file is not read at open, and any file can be damaged later. `kv_scrub()` reads every sealed segment back and checks every record, at about 790 MiB/s from the page cache. It holds no lock while it reads, because sealed segments never change: each segment's descriptor is duplicated under the read lock, so a compaction can retire the segment meanwhile, and only the verdict is published. `kv_get_stats()` reports the bytes checked and the number of damaged segments, and `kvtool check` says where the damage is.
 
 With `kv_options.background_scrub` set, a thread does this once for every sealed segment, first the ones present at open and then each one as it is sealed. It pauses 10 ms after every MiB, so it reads at most about 100 MiB/s and leaves the disk to the store's users. `kvserver` turns it on. Reads go through the page cache, so a segment written a moment ago is checked as cached, not as the drive holds it.
 
@@ -230,7 +230,7 @@ To check that this catches anything, I removed each fsync the store depends on, 
 
 **Fuzzing.** Three libFuzzer targets run with ASan and UBSan: arbitrary request lines into the protocol handler; arbitrary directory contents into recovery, where any state recovery decides on must survive compaction and reopening unchanged; and random operation sequences, including crashes, against a model. Five minutes each ran 1.6 million, 105,000 and 26,000 inputs without a failure, and CI fuzzes each target for a minute on every push.
 
-**Testing the tests.** `test_crash` and `test_model` were checked against deliberately broken builds: CRC checks disabled, truncation skipped, tombstones never written, compaction keeping stale versions. The first version of `test_crash` missed the skipped truncation, because new appends happened to overwrite the garbage. It now checks the exact length of every recovered segment. The concurrent scan test was checked the same way: a scan that walks the probe table instead of the entries fails it within a hundred scans, with a key seen twice.
+**Testing the tests.** `test_crash` and `test_model` were checked against deliberately broken builds: CRC checks disabled, truncation skipped, tombstones never written, compaction keeping stale versions. The first version of `test_crash` missed the skipped truncation, because new appends happened to overwrite the garbage. It now checks the exact length of every recovered segment. The concurrent scan test was checked the same way: a scan that walks the probe table instead of the entries failed it in all seven runs, between the 13th and the 81st scan, each time by returning a key twice.
 
 ### Bugs found along the way
 
