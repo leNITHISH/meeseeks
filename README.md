@@ -247,6 +247,8 @@ Bugs I wrote, and what found each one:
 - **fsync failures handled inconsistently**, found by `test_fsyncfail` after coverage showed that path had never run. Only a failed fsync of a segment's data made the store refuse writes; a failed directory fsync at rollover returned an ordinary I/O error and writing went on, and a failed fsync of compaction output, whose records may already be serving reads, only aborted the compaction.
 - **Unbounded reply buffering in the server**, found while reviewing it for resource limits. Replies to all the requests in one network read were collected before sending, so one 64 KB packet of pipelined `GET`s for a 900 KB value asked the server to hold 7 GB. Replies now go out once 1 MB is pending; in that scenario the server stays at 6 MB.
 - **A server that never shut down on macOS**, found by CI. The accept loop was woken by calling `shutdown()` on the listening socket, which works on Linux, but on macOS and the BSDs it fails and `accept()` keeps waiting. The loop now waits in `poll()` on the socket and a self-pipe.
+- **A scan that could hold the read lock across a million index entries**, found while reviewing scans for lock hold times. A batch stopped after 512 keys but not after a number of entries, so after mass deletes, with most entries free, one hold could walk all of them while a writer waited to publish. A hold now also stops after 4,096 entries.
+- **Options taken at face value**, found while reviewing `kvserver`: `-p abc` listened on a random port and `-t -1` set an idle timeout of about 50 days. Each option is now checked, and anything else is a usage error.
 
 ## Benchmarks
 
