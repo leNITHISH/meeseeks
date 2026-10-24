@@ -651,6 +651,10 @@ int main(int argc, char **argv)
     int i = 1;
     /* by hand, not getopt: "SET k -1" must not be read as an option */
     while (i < argc && argv[i][0] == '-') {
+        if (strcmp(argv[i], "--help") == 0) {
+            usage();
+            return 0;
+        }
         if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
             host = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc)

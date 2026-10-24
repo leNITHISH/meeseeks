@@ -256,6 +256,15 @@ static void test_local(const char *dir)
     expect_output("get", out, "\"-1 and more\"\n");
     free(out);
     free(err);
+    const char *help[] = {"--help", NULL};
+    CHECK(run_cli(dir, help, "", &out, &err) == 0);
+    CHECK(strstr(err, "usage: kvcli DIR"));
+    free(out);
+    free(err);
+    const char *nonsense[] = {"-x", NULL};
+    CHECK(run_cli(dir, nonsense, "", &out, &err) == 2);
+    free(out);
+    free(err);
     const char *bad[] = {dir, "DEL", NULL};
     CHECK(run_cli(dir, bad, "", &out, &err) == 1);
     expect_output("bad", out, "(error) wrong number of arguments for 'DEL'\n");
