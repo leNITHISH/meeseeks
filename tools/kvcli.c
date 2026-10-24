@@ -230,7 +230,7 @@ static int show_reply(const char *r, size_t n)
                 j++;
             const char *eq = memchr(r + i, '=', j - i);
             if (eq)
-                printf("%-12.*s %.*s\n", (int)(eq - (r + i)), r + i,
+                printf("%-16.*s %.*s\n", (int)(eq - (r + i)), r + i,
                        (int)(r + j - eq - 1), eq + 1);
             i = j + 1;
         }

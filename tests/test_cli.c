@@ -216,9 +216,10 @@ static void test_local(const char *dir)
 
     /* STATS, one name and value per line */
     CHECK(run_cli(dir, args, "STATS\n", &out, &err) == 0);
-    const char stats[] = "keys         3\nsegments     ";
+    const char stats[] = "keys             3\nsegments         ";
     CHECK(strncmp(out, stats, sizeof stats - 1) == 0);
-    CHECK(strstr(out, "\nindex_bytes  "));
+    CHECK(strstr(out, "\nindex_bytes      ") &&
+          strstr(out, "\ndamaged_segments 0\n"));
     free(out);
     free(err);
 
