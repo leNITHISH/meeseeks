@@ -77,6 +77,53 @@ static int run_cli(const char *dir, const char *const *args, const char *input,
     return WEXITSTATUS(st);
 }
 
+/* Like run_cli, but stdin is a pipe: send `first`, wait pause_us, then send
+ * `then`, as a person at the prompt would. */
+static int run_cli_paused(const char *dir, const char *const *args,
+                          const char *first, long pause_us, const char *then,
+                          char **out, char **err)
+{
+    char out_p[300], err_p[300];
+    snprintf(out_p, sizeof out_p, "%s-cli.out", dir);
+    snprintf(err_p, sizeof err_p, "%s-cli.err", dir);
+    const char *argv[16] = {g_kvcli};
+    int argc = 1;
+    while (args[argc - 1]) {
+        CHECK(argc < 15);
+        argv[argc] = args[argc - 1];
+        argc++;
+    }
+    argv[argc] = NULL;
+    int p[2];
+    CHECK(pipe(p) == 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int o = open(out_p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int e = open(err_p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (o < 0 || e < 0 || dup2(p[0], 0) < 0 || dup2(o, 1) < 0 ||
+            dup2(e, 2) < 0)
+            _exit(126);
+        close(p[1]);
+        execv(g_kvcli, (char *const *)argv);
+        _exit(127);
+    }
+    close(p[0]);
+    CHECK(write(p[1], first, strlen(first)) == (ssize_t)strlen(first));
+    tu_sleep_us(pause_us);
+    CHECK(write(p[1], then, strlen(then)) == (ssize_t)strlen(then));
+    close(p[1]);
+    int st;
+    CHECK(waitpid(pid, &st, 0) == pid);
+    *out = slurp(out_p);
+    *err = slurp(err_p);
+    unlink(out_p);
+    unlink(err_p);
+    CHECK(WIFEXITED(st));
+    return WEXITSTATUS(st);
+}
+
 static void expect_output(const char *what, const char *got, const char *want)
 {
     if (strcmp(got, want) != 0) {
@@ -474,6 +521,36 @@ typedef struct {
     int fd;
 } srv;
 
+static void *serve(void *arg);
+
+/* The server hangs up on a client idle for longer than -t, and a person at
+ * the prompt easily is: kvcli must connect again, not give up. */
+static void test_remote_idle(const char *dir)
+{
+    srv s;
+    CHECK_RC(kv_open(dir, NULL, &s.db), KV_OK);
+    int port;
+    CHECK(server_listen("127.0.0.1", 0, &s.fd, &port) == 0);
+    server_set_idle_timeout(300); /* read when a client connects */
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, serve, &s) == 0);
+    char ps[16];
+    snprintf(ps, sizeof ps, "%d", port);
+    const char *args[] = {"-h", "127.0.0.1", "-p", ps, NULL};
+    char *out, *err;
+    CHECK(run_cli_paused(dir, args, "SET k v\n", 1000000, "GET k\nQUIT\n",
+                         &out, &err) == 0);
+    expect_output("after a pause", out, "OK\n\"v\"\n");
+    CHECK(err[0] == '\0');
+    free(out);
+    free(err);
+    server_set_idle_timeout(SERVER_DEFAULT_IDLE_MS);
+    server_stop(s.fd);
+    pthread_join(th, NULL);
+    close(s.fd);
+    CHECK_RC(kv_close(s.db), KV_OK);
+}
+
 static void *serve(void *arg)
 {
     srv *s = arg;
@@ -546,6 +623,7 @@ int main(int argc, char **argv)
         {"directory open elsewhere", test_locked},
         {"EXPORT and IMPORT round trip", test_export_import},
         {"remote server, same answers", test_remote},
+        {"remote session outlives idle timeout", test_remote_idle},
         {"kvserver reports damage it finds", test_server_reports_damage},
     };
     return tu_run("test_cli", tests, sizeof tests / sizeof *tests);

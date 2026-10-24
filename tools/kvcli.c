@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,7 @@
 typedef struct {
     kv_t *db;   /* local mode */
     int fd;     /* remote mode, else -1 */
+    const char *host, *port;
     char *rbuf; /* received, not yet consumed */
     size_t rlen, rcap;
     sbuf reply; /* the last reply, without its newline */
@@ -128,6 +130,31 @@ static int send_all(int fd, const char *p, size_t n)
     return 0;
 }
 
+static int dial(const char *host, const char *port);
+
+/* Is the other end a kvserver? It answers PING with PONG; one at its
+ * connection limit answers with an error and hangs up. 0, or -1. */
+static int handshake(cli *c)
+{
+    if (send_all(c->fd, "PING\n", 5) != 0 || read_line(c, &c->reply) != 0) {
+        c->reply.len = 0;
+        return -1;
+    }
+    return strcmp(c->reply.data, "PONG") == 0 ? 0 : -1;
+}
+
+/* Has the server hung up since its last reply? kvserver closes clients
+ * that stay idle (-t), and a person at the prompt easily does. */
+static int server_hung_up(int fd)
+{
+    struct pollfd p = {.fd = fd, .events = POLLIN};
+    if (poll(&p, 1, 0) <= 0)
+        return 0; /* nothing waiting: still connected */
+    char b;
+    ssize_t r = recv(fd, &b, 1, MSG_PEEK);
+    return r == 0 || (r < 0 && errno != EINTR && errno != EAGAIN);
+}
+
 /* One request, one reply line in c->reply. -1 if the connection is gone. */
 static int roundtrip(cli *c, const char *line, size_t len)
 {
@@ -141,6 +168,15 @@ static int roundtrip(cli *c, const char *line, size_t len)
         if (c->reply.len && c->reply.data[c->reply.len - 1] == '\n')
             c->reply.data[--c->reply.len] = '\0';
         return 0;
+    }
+    /* Connect again if the server hung up while we were idle. That is
+     * checked before sending, and nothing is ever sent twice, so a request
+     * cannot be carried out twice. */
+    if (server_hung_up(c->fd)) {
+        close(c->fd);
+        c->rlen = 0;
+        if ((c->fd = dial(c->host, c->port)) < 0 || handshake(c) != 0)
+            return -1;
     }
     if (send_all(c->fd, line, len) != 0 || send_all(c->fd, "\n", 1) != 0)
         return -1;
@@ -654,12 +690,11 @@ int main(int argc, char **argv)
         }
         snprintf(where, sizeof where, "%s", dir);
     } else {
-        host = host ? host : "127.0.0.1";
-        port = port ? port : "7379";
+        c.host = host = host ? host : "127.0.0.1";
+        c.port = port = port ? port : "7379";
         if ((c.fd = dial(host, port)) < 0)
             return 2;
-        /* a server at its connection limit answers with an error and hangs up */
-        if (roundtrip(&c, "PING", 4) != 0 || strcmp(c.reply.data, "PONG") != 0) {
+        if (handshake(&c) != 0) {
             fprintf(stderr, "kvcli: %s port %s did not answer like a kvserver%s%s\n",
                     host, port, c.reply.len ? ": " : "",
                     c.reply.len ? c.reply.data : "");
