@@ -33,7 +33,7 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 
 ```sh
 make            # library, server, kvcli, kvtool, tests, benchmark (build/release)
-make test       # full test suite, about 20 seconds
+make test       # full test suite, about 25 seconds
 make test-asan  # the suite under AddressSanitizer + UBSan
 make test-tsan  # concurrent tests under ThreadSanitizer
 make coverage   # line coverage of src/ by the test suite (gcc + gcov)
@@ -198,7 +198,7 @@ Two problems shaped this design, both found by tests:
 
 ## Testing
 
-`make test` runs ten suites in about 20 seconds. They are also run under AddressSanitizer + UBSan (`make test-asan`) and ThreadSanitizer (`make test-tsan`), and `make coverage` reports how much of `src/` they execute: 94% of `kv.c`, 88% of compaction, 87% of recovery, 93% of the index, 85% of scrubbing, all of the record format and CRC code. Most of what is left is handling of failed memory allocations.
+`make test` runs ten suites in about 25 seconds. They are also run under AddressSanitizer + UBSan (`make test-asan`) and ThreadSanitizer (`make test-tsan`), and `make coverage` reports how much of `src/` they execute: 94% of `kv.c`, 88% of compaction, 87% of recovery, 93% of the index, 85% of scrubbing, all of the record format and CRC code. Most of what is left is handling of failed memory allocations.
 
 | suite | what it does |
 |---|---|

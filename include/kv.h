@@ -3,7 +3,7 @@
  *
  * Thread safety: one kv_t may be shared by any number of threads. Gets run in
  * parallel; puts and deletes are serialized but never wait for each other's
- * fsyncs (group commit); compaction runs alongside both. kv_close() must not
+ * fsyncs (group commit); compaction, scans and scrubs run alongside both. kv_close() must not
  * race with other calls on the same handle. A data directory can be open in
  * only one kv_t at a time, across threads and processes (kv_open returns
  * KV_ERR_LOCKED otherwise).
@@ -122,7 +122,8 @@ int kv_sync(kv_t *db);
  * before a get runs into it: a segment loaded from its hint file at open is
  * not checksummed until then. Reads and writes go on meanwhile. Returns
  * KV_OK if every segment is intact, KV_ERR_CORRUPT if any is damaged (see
- * kv_stats.damaged_segments; `kvtool check` says where), or KV_ERR_IO.
+ * kv_stats.damaged_segments; `kvtool check` says where), KV_ERR_IO or
+ * KV_ERR_NOMEM.
  * Reads go through the page cache, so recently written data is checked as
  * cached.
  */
