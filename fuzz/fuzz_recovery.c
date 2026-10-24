@@ -9,8 +9,9 @@
  *
  * Whatever recovery decides the store contains, it has to stay consistent:
  * every get answers OK, NOT_FOUND or (for hint-loaded data that was never
- * checksummed) CORRUPT, and a successful compaction followed by reopening,
- * with and without hints, must give exactly the same answers.
+ * checksummed) CORRUPT, a scrub finds damage exactly when compaction does,
+ * and a successful compaction followed by reopening, with and without
+ * hints, must give exactly the same answers.
  */
 #include <fcntl.h>
 #include <stdint.h>
@@ -227,8 +228,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     answer before[MAXKEYS], after[MAXKEYS];
     ask_all(db, before);
 
+    /* A scrub reads what compaction is about to, every record of every
+     * sealed segment (replay already cut the active one back to its last
+     * good record), so the two must agree about damage. */
+    int scrub = kv_scrub(db);
+    if (scrub != KV_OK && scrub != KV_ERR_CORRUPT)
+        abort();
     int rc = kv_compact(db);
     if (rc != KV_OK && rc != KV_ERR_CORRUPT)
+        abort();
+    if ((scrub == KV_ERR_CORRUPT) != (rc == KV_ERR_CORRUPT))
         abort();
     if (rc == KV_OK) {
         ask_all(db, after);
