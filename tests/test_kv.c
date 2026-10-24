@@ -985,6 +985,185 @@ static void test_backup_shares_nothing_writable(const char *dir)
     tu_rmrf(target);
 }
 
+/* ---------- key iteration ---------- */
+
+enum { SCAN_KEYS = 3000 };
+
+/* Even keys fit inside an index entry, odd ones are long enough to be
+ * stored on the heap. */
+static size_t scan_key(int i, char *buf, size_t n)
+{
+    return (size_t)snprintf(buf, n, i % 2 ? "a-key-long-enough-for-the-heap:%d"
+                                          : "k:%d",
+                            i);
+}
+
+/* Number of the key made by scan_key, or -1 for any other key. */
+static int scan_key_number(const void *key, size_t klen)
+{
+    char buf[64];
+    if (klen == 0 || klen >= sizeof buf)
+        return -1;
+    memcpy(buf, key, klen);
+    buf[klen] = '\0';
+    const char *colon = strrchr(buf, ':');
+    if (!colon || memchr(buf, '\0', klen))
+        return -1;
+    int i = atoi(colon + 1);
+    char again[64];
+    if (i < 0 || i >= SCAN_KEYS || scan_key(i, again, sizeof again) != klen ||
+        memcmp(again, key, klen) != 0)
+        return -1;
+    return i;
+}
+
+typedef struct {
+    int seen[SCAN_KEYS];
+    int others, visited;
+    int stop_at;   /* return 42 from this visit on (0: never) */
+    kv_t *db;      /* if set, write to the store from inside the callback */
+} scan_tally;
+
+static int tally(void *ctx, const void *key, size_t klen)
+{
+    scan_tally *t = ctx;
+    t->visited++;
+    int i = scan_key_number(key, klen);
+    if (i < 0)
+        t->others++;
+    else
+        t->seen[i]++;
+    if (t->db && i >= 0) {
+        /* Delete the key just visited and add a new one, which may land in
+         * the freed entry (behind the cursor) or a fresh one (ahead). */
+        char k[64];
+        CHECK_RC(kv_delete(t->db, key, klen), KV_OK);
+        size_t n = (size_t)snprintf(k, sizeof k, "added during the scan %d", i);
+        CHECK_RC(kv_put(t->db, k, n, "x", 1), KV_OK);
+        void *v;
+        size_t vlen;
+        CHECK_RC(kv_get(t->db, k, n, &v, &vlen), KV_OK);
+        free(v);
+    }
+    return t->stop_at && t->visited >= t->stop_at ? 42 : 0;
+}
+
+/* Every key with present(i) seen exactly once, and no other scan_key. */
+static void check_tally(const scan_tally *t, int (*present)(int i))
+{
+    for (int i = 0; i < SCAN_KEYS; i++)
+        if (t->seen[i] != (present(i) ? 1 : 0)) {
+            fprintf(stderr, "key %d seen %d times\n", i, t->seen[i]);
+            exit(1);
+        }
+}
+
+static int all_keys(int i)
+{
+    (void)i;
+    return 1;
+}
+
+static int not_third(int i)
+{
+    return i % 3 != 0;
+}
+
+static void test_scan(const char *dir)
+{
+    kv_options o = small_opts(64 * 1024);
+    kv_t *db = open_db(dir, &o);
+    scan_tally *t = calloc(1, sizeof *t);
+    CHECK(t);
+    CHECK_RC(kv_scan(db, tally, t), KV_OK); /* empty store */
+    CHECK(t->visited == 0);
+
+    char k[64];
+    for (int i = 0; i < SCAN_KEYS; i++) {
+        size_t n = scan_key(i, k, sizeof k);
+        CHECK_RC(kv_put(db, k, n, "v", 1), KV_OK);
+    }
+    CHECK_RC(kv_put(db, "", 0, "empty key", 9), KV_OK);
+    CHECK_RC(kv_put(db, "nul\0key", 7, "v", 1), KV_OK);
+    CHECK_RC(kv_scan(db, tally, t), KV_OK);
+    check_tally(t, all_keys);
+    CHECK(t->others == 2 && t->visited == SCAN_KEYS + 2);
+
+    /* Deleted keys vanish, overwritten ones are still seen once, and the
+     * same holds after compaction and after the index is rebuilt. */
+    for (int i = 0; i < SCAN_KEYS; i += 3) {
+        size_t n = scan_key(i, k, sizeof k);
+        CHECK_RC(kv_delete(db, k, n), KV_OK);
+    }
+    for (int i = 1; i < SCAN_KEYS; i += 5) {
+        size_t n = scan_key(i, k, sizeof k);
+        if (not_third(i))
+            CHECK_RC(kv_put(db, k, n, "again", 5), KV_OK);
+    }
+    for (int round = 0; round < 3; round++) {
+        if (round == 1)
+            CHECK_RC(kv_compact(db), KV_OK);
+        if (round == 2) {
+            CHECK_RC(kv_close(db), KV_OK);
+            db = open_db(dir, &o);
+        }
+        memset(t, 0, sizeof *t);
+        CHECK_RC(kv_scan(db, tally, t), KV_OK);
+        check_tally(t, not_third);
+        CHECK(t->others == 2);
+    }
+
+    /* A nonzero return stops the scan and becomes its result. */
+    memset(t, 0, sizeof *t);
+    t->stop_at = 10;
+    CHECK(kv_scan(db, tally, t) == 42);
+    CHECK(t->visited == 10);
+
+    /* Resumable: a few keys per call, every key exactly once overall. */
+    memset(t, 0, sizeof *t);
+    uint64_t cursor = 0;
+    int calls = 0;
+    do {
+        int before = t->visited;
+        CHECK_RC(kv_scan_from(db, &cursor, 7, tally, t), KV_OK);
+        CHECK(t->visited - before <= 7);
+        calls++;
+    } while (cursor != 0);
+    check_tally(t, not_third);
+    CHECK(t->others == 2 && calls >= t->visited / 7);
+
+    /* Resuming after the callback stopped picks up at the next key. */
+    memset(t, 0, sizeof *t);
+    cursor = 0;
+    t->stop_at = 1;
+    int stops = 0;
+    for (;;) {
+        int rc = kv_scan_from(db, &cursor, 0, tally, t);
+        CHECK(rc == KV_OK || rc == 42);
+        stops += rc == 42;
+        t->stop_at = t->visited + 1;
+        if (cursor == 0)
+            break;
+    }
+    check_tally(t, not_third);
+    CHECK(stops == t->visited && t->others == 2);
+    CHECK_RC(kv_scan_from(db, NULL, 0, tally, t), KV_ERR_INVALID);
+    CHECK_RC(kv_scan_from(db, &cursor, 0, NULL, t), KV_ERR_INVALID);
+    cursor = UINT64_MAX; /* a cursor past the end is simply done */
+    CHECK_RC(kv_scan_from(db, &cursor, 0, tally, t), KV_OK);
+    CHECK(cursor == 0);
+
+    /* The callback may write: no lock is held while it runs. Keys that
+     * exist for the whole scan are still visited exactly once each. */
+    memset(t, 0, sizeof *t);
+    t->db = db;
+    CHECK_RC(kv_scan(db, tally, t), KV_OK);
+    check_tally(t, not_third);
+    CHECK(kv_count(db) == 2 + (size_t)(SCAN_KEYS - (SCAN_KEYS + 2) / 3));
+    free(t);
+    CHECK_RC(kv_close(db), KV_OK);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -1021,6 +1200,7 @@ int main(void)
         {"backup to another file system", test_backup_other_filesystem},
         {"backup is isolated from the original",
          test_backup_shares_nothing_writable},
+        {"scan", test_scan},
     };
     return tu_run("test_kv", tests, sizeof tests / sizeof *tests);
 }

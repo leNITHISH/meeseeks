@@ -82,6 +82,28 @@ int kv_get(kv_t *db, const void *key, size_t klen, void **val, size_t *vlen);
 /* Returns KV_OK if the key existed, KV_NOT_FOUND otherwise. */
 int kv_delete(kv_t *db, const void *key, size_t klen);
 
+/* Called once per key by kv_scan(). Return 0 to continue; any other value
+ * stops the scan, and kv_scan() returns it. The key is only valid during the
+ * call. No lock is held, so the callback may use the store, kv_get() and
+ * kv_put() included. */
+typedef int (*kv_scan_fn)(void *ctx, const void *key, size_t klen);
+
+/*
+ * Call fn for every key, in no particular order. Reads and writes go on
+ * during the scan. Every key that exists for the whole scan is visited
+ * exactly once; a key added or deleted while it runs may or may not be, and
+ * one deleted and added again may be visited twice. Returns KV_OK, the
+ * callback's nonzero value, or KV_ERR_NOMEM.
+ */
+int kv_scan(kv_t *db, kv_scan_fn fn, void *ctx);
+
+/* Resumable kv_scan(): visit at most max_keys keys (0 = no limit), starting
+ * from *cursor, which is 0 for a new scan. On return *cursor says where to
+ * resume, and is 0 once every key has been visited. A cursor is only
+ * meaningful for the handle that produced it. */
+int kv_scan_from(kv_t *db, uint64_t *cursor, size_t max_keys, kv_scan_fn fn,
+                 void *ctx);
+
 /* Rewrite all sealed segments, keeping only live records, and write a hint
  * file for each new segment. Reads and writes continue while it runs. */
 int kv_compact(kv_t *db);

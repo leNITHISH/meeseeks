@@ -404,6 +404,103 @@ static void test_backup_during_writes(const char *dir)
     CHECK_RC(kv_close(s.db), KV_OK);
 }
 
+/* ---------- scans while the index changes ---------- */
+
+/*
+ * One thread scans over and over while another deletes and re-adds a set of
+ * keys and adds new ones fast enough to grow the index several times, and a
+ * third compacts. Deletion shifts probe-table slots and growth reshuffles
+ * them, so a scan that walked the table would skip or repeat keys. Keys that
+ * nobody touches must turn up exactly once in every scan.
+ */
+enum { SC_STABLE = 2000, SC_CHURN = 64, SC_FRESH = 480 * 256 };
+
+typedef struct {
+    kv_t *db;
+    atomic_int stop;
+    int seen[SC_STABLE];
+} sc_shared;
+
+static void *sc_writer(void *arg)
+{
+    sc_shared *s = arg;
+    char k[32];
+    for (int fresh = 0; fresh < SC_FRESH;) {
+        for (int i = 0; i < SC_CHURN; i++) {
+            snprintf(k, sizeof k, "churn-%d", i);
+            int rc = kv_delete(s->db, k, strlen(k));
+            CHECK(rc == KV_OK || rc == KV_NOT_FOUND);
+            CHECK_RC(kv_put(s->db, k, strlen(k), "c", 1), KV_OK);
+        }
+        for (int i = 0; i < 256; i++, fresh++) {
+            snprintf(k, sizeof k, "fresh-%d", fresh);
+            CHECK_RC(kv_put(s->db, k, strlen(k), "f", 1), KV_OK);
+        }
+    }
+    atomic_store(&s->stop, 1);
+    return NULL;
+}
+
+static void *sc_compactor(void *arg)
+{
+    sc_shared *s = arg;
+    while (!atomic_load(&s->stop)) {
+        CHECK_RC(kv_compact(s->db), KV_OK);
+        tu_sleep_us(5000);
+    }
+    return NULL;
+}
+
+static int sc_count(void *ctx, const void *key, size_t klen)
+{
+    sc_shared *s = ctx;
+    char buf[32];
+    if (klen < 8 || klen >= sizeof buf || memcmp(key, "stable-", 7) != 0)
+        return 0;
+    memcpy(buf, key, klen);
+    buf[klen] = '\0';
+    int i = atoi(buf + 7);
+    CHECK(i >= 0 && i < SC_STABLE);
+    s->seen[i]++;
+    return 0;
+}
+
+static void test_scan_while_index_changes(const char *dir)
+{
+    kv_options o;
+    kv_default_options(&o);
+    o.sync_policy = KV_SYNC_NONE;
+    o.segment_size = 1 << 20;
+    sc_shared s;
+    memset(&s, 0, sizeof s);
+    CHECK_RC(kv_open(dir, &o, &s.db), KV_OK);
+    char k[32];
+    for (int i = 0; i < SC_STABLE; i++) {
+        snprintf(k, sizeof k, "stable-%d", i);
+        CHECK_RC(kv_put(s.db, k, strlen(k), "s", 1), KV_OK);
+    }
+    pthread_t w, c;
+    CHECK(pthread_create(&w, NULL, sc_writer, &s) == 0);
+    CHECK(pthread_create(&c, NULL, sc_compactor, &s) == 0);
+    int scans = 0;
+    do {
+        memset(s.seen, 0, sizeof s.seen);
+        CHECK_RC(kv_scan(s.db, sc_count, &s), KV_OK);
+        for (int i = 0; i < SC_STABLE; i++)
+            if (s.seen[i] != 1) {
+                fprintf(stderr, "scan %d: stable-%d seen %d times\n", scans, i,
+                        s.seen[i]);
+                exit(1);
+            }
+        scans++;
+    } while (!atomic_load(&s.stop));
+    pthread_join(w, NULL);
+    pthread_join(c, NULL);
+    CHECK(kv_count(s.db) == SC_STABLE + SC_CHURN + SC_FRESH);
+    printf("[%d scans] ", scans);
+    CHECK_RC(kv_close(s.db), KV_OK);
+}
+
 int main(void)
 {
     static const test_case tests[] = {
@@ -412,6 +509,7 @@ int main(void)
         {"group commit, 8 fsync-always writers", test_group_commit},
         {"compactor not starved by writers", test_compactor_not_starved},
         {"backups during writes and compactions", test_backup_during_writes},
+        {"scans while the index changes", test_scan_while_index_changes},
     };
     return tu_run("test_concurrency", tests, sizeof tests / sizeof *tests);
 }

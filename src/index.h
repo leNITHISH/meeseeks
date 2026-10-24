@@ -71,6 +71,19 @@ int index_remove(kv_index *idx, const void *key, size_t klen, kv_loc *old);
 /* Iterate: start with *cursor = 0; returns NULL when done. */
 kv_loc *index_next(kv_index *idx, size_t *cursor);
 
+/*
+ * Entries by number, for walks that drop the lock between steps. Removing a
+ * key shifts later slots of its probe run backwards, and growing reshuffles
+ * the whole probe table, so a position in the table means nothing once the
+ * index has changed. Entries never move: a key keeps its entry number for as
+ * long as it is in the index. Every entry number in use is below
+ * index_entry_limit().
+ */
+uint32_t index_entry_limit(const kv_index *idx);
+
+/* The key stored in entry n and its length, or NULL if the entry is free. */
+const uint8_t *index_entry_key(const kv_index *idx, uint32_t n, uint32_t *klen);
+
 /* Bytes of memory held by the index (tables, entries, long keys). */
 size_t index_memory(const kv_index *idx);
 

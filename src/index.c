@@ -10,6 +10,7 @@
 #define CHUNK_SIZE (1u << CHUNK_SHIFT)
 #define MAX_LOAD_NUM 3 /* grow past 3/4 full */
 #define MAX_LOAD_DEN 4
+#define ENTRY_FREE UINT32_MAX /* klen of a released entry; keys are shorter */
 
 /* ---------- SipHash ---------- */
 
@@ -168,6 +169,7 @@ static void entry_release(kv_index *idx, uint32_t n)
         free(e->key.ptr);
         idx->heap_bytes -= e->klen;
     }
+    e->klen = ENTRY_FREE; /* scans walk entries and must skip this one */
     e->loc.offset = idx->free_head; /* the free list threads through here */
     idx->free_head = n + 1;
 }
@@ -335,6 +337,22 @@ kv_loc *index_next(kv_index *idx, size_t *cursor)
             return &entry_at(idx, slot_entry(s))->loc;
     }
     return NULL;
+}
+
+uint32_t index_entry_limit(const kv_index *idx)
+{
+    return idx->used;
+}
+
+const uint8_t *index_entry_key(const kv_index *idx, uint32_t n, uint32_t *klen)
+{
+    if (n >= idx->used)
+        return NULL;
+    const index_entry *e = entry_at(idx, n);
+    if (e->klen == ENTRY_FREE)
+        return NULL;
+    *klen = e->klen;
+    return entry_key(e);
 }
 
 size_t index_memory(const kv_index *idx)

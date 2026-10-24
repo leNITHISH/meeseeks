@@ -733,6 +733,88 @@ int kv_get(kv_t *db, const void *key, size_t klen, void **val, size_t *vlen)
     return KV_OK;
 }
 
+/* ---------- key iteration ---------- */
+
+/*
+ * A scan walks the index's entry numbers, not its probe table: deleting a
+ * key pulls later slots of its probe run backwards and growing reshuffles
+ * them all, so a cursor into the table could skip a key that was there the
+ * whole time. A key keeps its entry for as long as it exists. Keys are copied
+ * out under the read lock a batch at a time, and the callback runs with no
+ * lock held, so it can use the store itself.
+ */
+#define SCAN_BATCH_KEYS 512u /* per read-lock hold, like compaction's */
+#define SCAN_BATCH_BYTES (1u << 20)
+
+typedef struct {
+    uint32_t entry, len;
+    size_t off; /* in the batch buffer */
+} scan_key;
+
+int kv_scan_from(kv_t *db, uint64_t *cursor, size_t max_keys, kv_scan_fn fn,
+                 void *ctx)
+{
+    if (!db || !cursor || !fn)
+        return KV_ERR_INVALID;
+    uint64_t n = *cursor, limit = 0;
+    size_t left = max_keys ? max_keys : SIZE_MAX;
+    scan_key keys[SCAN_BATCH_KEYS];
+    uint8_t *buf = NULL;
+    size_t cap = 0;
+    int rc = KV_OK;
+    while (rc == KV_OK && left > 0) {
+        size_t nk = 0, used = 0;
+        kv_read_lock(db);
+        limit = index_entry_limit(&db->idx);
+        for (; n < limit && nk < SCAN_BATCH_KEYS && nk < left; n++) {
+            uint32_t klen;
+            const uint8_t *k = index_entry_key(&db->idx, (uint32_t)n, &klen);
+            if (!k)
+                continue;
+            if (nk > 0 && used + klen > SCAN_BATCH_BYTES)
+                break; /* resume at this entry */
+            if (used + klen > cap) {
+                size_t ncap = cap ? cap : 4096;
+                while (ncap < used + klen)
+                    ncap *= 2;
+                uint8_t *t = realloc(buf, ncap);
+                if (!t) {
+                    rc = KV_ERR_NOMEM; /* deliver what we have, resume here */
+                    break;
+                }
+                buf = t;
+                cap = ncap;
+            }
+            if (klen)
+                memcpy(buf + used, k, klen);
+            keys[nk++] = (scan_key){(uint32_t)n, klen, used};
+            used += klen;
+        }
+        kv_unlock(db);
+        for (size_t i = 0; i < nk; i++) {
+            const uint8_t *k = buf ? buf + keys[i].off : (const uint8_t *)"";
+            int r = fn(ctx, k, keys[i].len);
+            if (r != 0) {
+                n = (uint64_t)keys[i].entry + 1;
+                rc = r;
+                break;
+            }
+        }
+        left -= nk;
+        if (n >= limit)
+            break;
+    }
+    free(buf);
+    *cursor = n >= limit ? 0 : n;
+    return rc;
+}
+
+int kv_scan(kv_t *db, kv_scan_fn fn, void *ctx)
+{
+    uint64_t cursor = 0;
+    return kv_scan_from(db, &cursor, 0, fn, ctx);
+}
+
 /* ---------- introspection ---------- */
 
 void kv_get_stats(kv_t *db, kv_stats *st)
