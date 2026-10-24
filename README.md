@@ -18,6 +18,8 @@ Results on a 2013 dual-core laptop with a budget SATA SSD (details in [Benchmark
 | startup, 1M keys | 0.31 s from hint files, 1.4 s replaying 1 GB of segments |
 | index memory | 66 bytes per key |
 | gets while a compaction runs | p99.9 of 18.5 us, worst 1.5 ms |
+| scan every key, 1M keys | 17 ms |
+| scrub, reading back and checking every record | 790 MiB/s from the page cache |
 | TCP server, 8 pipelining clients | 189,000 requests/s at 90% GET |
 
 ## Contents
