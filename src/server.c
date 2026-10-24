@@ -679,6 +679,21 @@ static void usage(const char *prog)
             prog, SERVER_DEFAULT_MAX_CONNS, SERVER_DEFAULT_IDLE_MS / 1000);
 }
 
+/* A whole decimal number from lo to hi, or a usage error. */
+static unsigned long number_arg(const char *prog, int opt, const char *s,
+                                unsigned long lo, unsigned long hi)
+{
+    char *end;
+    errno = 0;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno || end == s || *end || s[0] == '-' || v < lo || v > hi) {
+        fprintf(stderr, "%s: -%c takes a number from %lu to %lu, not '%s'\n",
+                prog, opt, lo, hi, s);
+        exit(2);
+    }
+    return v;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = "./data", *host = "127.0.0.1";
@@ -695,8 +710,8 @@ int main(int argc, char **argv)
         case 'H':
             host = optarg;
             break;
-        case 'p':
-            port = atoi(optarg);
+        case 'p': /* 0 picks a free port, printed at startup */
+            port = (int)number_arg(argv[0], opt, optarg, 0, 65535);
             break;
         case 's':
             if (strcmp(optarg, "always") == 0)
@@ -711,16 +726,28 @@ int main(int argc, char **argv)
             }
             break;
         case 'n':
-            o.sync_every_n = (uint32_t)strtoul(optarg, NULL, 10);
+            o.sync_every_n =
+                (uint32_t)number_arg(argv[0], opt, optarg, 1, UINT32_MAX);
             break;
-        case 'c':
-            o.auto_compact_ratio = strtod(optarg, NULL);
+        case 'c': {
+            char *end;
+            o.auto_compact_ratio = strtod(optarg, &end);
+            if (end == optarg || *end || !(o.auto_compact_ratio >= 0) ||
+                !(o.auto_compact_ratio < 1)) {
+                fprintf(stderr, "%s: -c takes a fraction from 0 up to 1, not "
+                                "'%s'\n",
+                        argv[0], optarg);
+                return 2;
+            }
             break;
+        }
         case 'm':
-            server_set_max_conns((size_t)strtoul(optarg, NULL, 10));
+            server_set_max_conns(
+                (size_t)number_arg(argv[0], opt, optarg, 1, 1000000));
             break;
         case 't':
-            server_set_idle_timeout((unsigned)strtoul(optarg, NULL, 10) * 1000);
+            server_set_idle_timeout(
+                (unsigned)number_arg(argv[0], opt, optarg, 0, 4000000) * 1000);
             break;
         default:
             usage(argv[0]);

@@ -132,8 +132,15 @@ int main(int argc, char **argv)
         else if (parse_name(e->d_name, "hint", &id))
             nhints++;
         else if (parse_name(e->d_name, "seg", &id)) {
-            if (nsegs == cap)
-                segs = realloc(segs, (cap = cap ? cap * 2 : 16) * sizeof *segs);
+            if (nsegs == cap) {
+                cap = cap ? cap * 2 : 16;
+                segfile *t = realloc(segs, cap * sizeof *segs);
+                if (!t) {
+                    fprintf(stderr, "kvtool: out of memory\n");
+                    return 2;
+                }
+                segs = t;
+            }
             segs[nsegs].id = id;
             snprintf(segs[nsegs].name, sizeof segs[nsegs].name, "%.63s",
                      e->d_name); /* a validated 21-character name */
