@@ -23,9 +23,9 @@ The store would also need to count live bytes per segment. It counts them only f
 
 ## Server protocol
 
-The text protocol cannot carry line breaks in keys or values, and every client needs its own thread. Two changes would fix that:
+The text protocol cannot carry line breaks in keys or values, `SCAN` cannot list keys that hold whitespace, and every client needs its own thread. Two changes would fix that:
 
-- Speak RESP, the Redis protocol. Values become binary-safe, and `redis-cli` and `redis-benchmark` work against `kvserver` out of the box, which would make a direct comparison with Redis possible.
+- Speak RESP, the Redis protocol. Keys and values become binary-safe, and `redis-cli` and `redis-benchmark` work against `kvserver` out of the box, which would make a direct comparison with Redis possible.
 - Replace thread-per-connection with an event loop (epoll on Linux, kqueue on macOS), so the client limit is set by file descriptors rather than threads.
 
 ## Smaller ideas
